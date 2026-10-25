@@ -1,0 +1,12 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^cargo build 2>&1 \\| tail -80$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^sed -i 's/Style::new\\(\\)\\.fg\\(TOKEN\\)/Style::new\\(\\)\\.fg\\(TOOL\\)/' src/ui/config_view\\.rs && sed -i 's/\\^use anyhow::Result;\\$//' src/agent/mod\\.rs && sed -i 's/let mut session = Session \\{/let session = Session \\{/' src/agent/mod\\.rs && cargo build 2>&1 \\| tail -60$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
