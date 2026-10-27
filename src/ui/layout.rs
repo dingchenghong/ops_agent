@@ -30,6 +30,7 @@ pub struct FrameLayout {
     pub input: Rect,
     /// 输入框上边框（可拖动改高度）
     pub input_divider: Rect,
+    /// 状态行：与输入框底边框同一行（整屏最后一行）
     pub footer: Rect,
 }
 
@@ -58,12 +59,20 @@ pub fn compute(area: Rect, app: &mut App) -> FrameLayout {
         )
     };
 
-    // 输入框高度可拖动
-    let max_input = main.height.saturating_sub(7).clamp(INPUT_MIN, INPUT_MAX);
+    // 输入框高度可拖动。
+    // 注意：输入框的最后一行同时就是状态行（整屏最后一行），左边栏的底边框也落在这一行，
+    // 这样窗口底部只有一条连续的横线，不会再出现「线比文字高一行」的错位感。
+    let max_input = main.height.saturating_sub(6).clamp(INPUT_MIN, INPUT_MAX);
     let input_h = app.input_height.clamp(INPUT_MIN, max_input);
-    let [chat, input, footer] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(input_h), Constraint::Length(1)])
-            .areas(main);
+    let [chat, input] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(input_h)]).areas(main);
+    // 状态行 = 输入框底边框所在行
+    let footer = Rect {
+        x: input.x,
+        y: input.y + input.height.saturating_sub(1),
+        width: input.width,
+        height: input.height.min(1),
+    };
 
     // 菜单项位置
     let name_w = display_width("◆ OpsAgent") as u16;

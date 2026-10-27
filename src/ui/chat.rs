@@ -414,6 +414,13 @@ pub fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         block_border(active)
     };
+
+    // 底边框上放两段文字：左边是状态/提示，右边是操作说明。
+    // 这样整屏最后一行既是输入框的下边框，也是状态行，左边栏底边框与之同高。
+    let right = " Enter 发送 · Ctrl+J 换行 ";
+    let left_budget =
+        (area.width.saturating_sub(2) as usize).saturating_sub(display_width(right));
+
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(border_style)
@@ -421,10 +428,8 @@ pub fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
             " ✎ 输入 ",
             Style::new().fg(if active { ACCENT } else { ACCENT_SOFT }),
         )]))
-        .title_bottom(Line::from(Span::styled(
-            " Enter 发送 · Ctrl+J 换行 ",
-            dim(),
-        )));
+        .title_bottom(status_line(app, left_budget))
+        .title_bottom(Line::from(Span::styled(right, dim())).right_aligned());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height == 0 || inner.width == 0 {
@@ -497,45 +502,52 @@ pub fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-pub fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let w = area.width as usize;
+/// 状态行内容（画在输入框底边框左侧）：提示条 > 悬停提示 > 快捷键说明
+fn status_line(app: &App, width: usize) -> Line<'static> {
     if let Some(t) = app.active_toast() {
         let style = if t.error { Style::new().fg(ERR) } else { Style::new().fg(OK) };
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(" ⓘ ", style.add_modifier(Modifier::BOLD)),
-                Span::styled(clip(&t.text, w.saturating_sub(4)), style),
-            ])),
-            area,
-        );
-        return;
+        return Line::from(vec![
+            Span::styled(" ⓘ ", style.add_modifier(Modifier::BOLD)),
+            Span::styled(clip(&t.text, width.saturating_sub(4)), style),
+        ]);
     }
     if let Some(hover) = app.hover_hint() {
-        // 做成通栏高亮徽标，比一行小字更容易被看到
+        // 做成高亮徽标，比一行小字更容易被看到
         let text = format!(" {hover} ");
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                clip(&text, w),
-                Style::new()
-                    .fg(Color::Black)
-                    .bg(ACCENT)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            area,
-        );
-        return;
+        return Line::from(Span::styled(
+            clip(&text, width),
+            Style::new()
+                .fg(Color::Black)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ));
     }
-    let hint = if app.busy() {
-        " Esc 取消当前任务 · Ctrl+C 退出".to_string()
-    } else if app.cfg.auto_approve_all {
-        " ! 已开启「跳过确认」 · 设置 里可关闭 · Ctrl+C 退出".to_string()
-    } else {
-        " Tab 侧边栏 · Ctrl+A 全选 · Ctrl+C 复制 · Ctrl+U 清空 · F1 关于 · F2 设置".to_string()
-    };
+    let hint = hint_text(&app.cfg, app.busy(), width);
     let style = if app.cfg.auto_approve_all && !app.busy() {
         Style::new().fg(WARN)
     } else {
         dim()
     };
-    frame.render_widget(Paragraph::new(Span::styled(clip(&hint, w), style)), area);
+    Line::from(Span::styled(hint, style))
+}
+
+/// 按可用宽度挑选一档快捷键说明，避免窄终端里被截断成半句话
+fn hint_text(cfg: &crate::config::Config, busy: bool, width: usize) -> String {
+    let candidates: [&str; 3] = if busy {
+        [" Esc 取消当前任务 · Ctrl+C 退出", " Esc 取消任务", " Esc"]
+    } else if cfg.auto_approve_all {
+        [" ! 已开启「跳过确认」 · 设置 里可关闭 · Ctrl+C 退出", " ! 已开启「跳过确认」", " ! 跳过确认"]
+    } else {
+        [
+            " Tab 侧边栏 · Ctrl+A 全选 · Ctrl+C 复制 · Ctrl+U 清空 · F1 关于 · F2 设置",
+            " Tab 侧边栏 · Ctrl+A 全选 · Ctrl+C 复制 · F2 设置",
+            " Tab 侧边栏 · F2 设置",
+        ]
+    };
+    let picked = candidates
+        .iter()
+        .find(|h| display_width(h) <= width)
+        .copied()
+        .unwrap_or_default();
+    picked.to_string()
 }

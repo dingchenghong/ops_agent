@@ -951,8 +951,8 @@ impl App {
                     }
                 }
                 Some(Drag::Input) => {
-                    // footer.y 是输入框的下边界
-                    let h = lay.footer.y.saturating_sub(m.row);
+                    // 输入框的下边界就是状态行（lay.footer）所在行，高度要把这一行算进去
+                    let h = lay.footer.y.saturating_add(1).saturating_sub(m.row);
                     self.input_height =
                         h.clamp(crate::ui::layout::INPUT_MIN, crate::ui::layout::INPUT_MAX);
                 }
@@ -1591,9 +1591,11 @@ mod resize_tests {
 
         a.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), d.x + 2, d.y));
         assert_eq!(a.drag, Some(Drag::Input));
-        a.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), d.x + 2, bottom - 8));
+        // 拖到「底边框算起第 8 行」高度
+        let target_row = bottom.saturating_add(1).saturating_sub(8);
+        a.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), d.x + 2, target_row));
         assert_eq!(a.input_height, 8);
-        a.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), d.x + 2, bottom - 8));
+        a.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), d.x + 2, target_row));
 
         a.adjust_input_height(100);
         assert_eq!(a.input_height, crate::ui::layout::INPUT_MAX);

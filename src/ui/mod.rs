@@ -38,8 +38,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         sidebar::draw(frame, app, &lay);
     }
     chat::draw_messages(frame, app, lay.chat);
+    // 状态行（提示/快捷键）已经画在输入框的底边框上，不再单独占一行
     chat::draw_input(frame, app, lay.input);
-    chat::draw_footer(frame, app, lay.footer);
 
     // 有弹窗时先压暗背景
     if app.overlay != Overlay::None || app.approval.is_some() {
@@ -465,7 +465,7 @@ mod hint_tests {
 
     /// 悬停在分隔条上时，状态行应显示拖动提示
     #[test]
-    fn hover_shows_footer_hint() {
+    fn hover_shows_hint_in_status_line() {
         let mut app = test_app();
         app.hover_divider = Some(crate::app::Drag::Sidebar);
         let screen = render(&mut app, 120, 32, "hover");
@@ -540,6 +540,45 @@ mod selection_tests {
         for _ in 0..20 {
             app.input.left_extend();
             let _ = render(&mut app, 110, 32, "cjk-select-move");
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod bottom_line_tests {
+    use super::tests::{render, test_app};
+
+    /// 整屏最后一行：左边栏底边框、状态文字、输入框底边框必须在同一行，
+    /// 否则底部会出现「线比文字高一行」的错位。
+    #[test]
+    fn sidebar_bottom_aligns_with_status_line() {
+        for (w, h) in [(100u16, 30u16), (80, 24), (140, 45)] {
+            let mut app = test_app();
+            app.size = (w, h);
+            let screen = render(&mut app, w, h, "bottom-line");
+            let last = screen
+                .lines()
+                .nth(h as usize - 1)
+                .expect("渲染结果应有最后一行");
+
+            assert!(
+                last.contains('╰'),
+                "{w}x{h}: 最后一行应有左边栏/输入框的底角：{last:?}"
+            );
+            assert!(last.contains('╯'), "{w}x{h}: 最后一行应有右底角：{last:?}");
+            let flat_last = super::tests::flat(last);
+            assert!(
+                flat_last.contains("Tab侧边栏") || flat_last.contains("Esc") || flat_last.contains('!'),
+                "{w}x{h}: 最后一行应有状态提示文字：{last:?}"
+            );
+            // 左边栏底边框不能落到倒数第二行
+            if let Some(prev) = screen.lines().nth(h as usize - 2) {
+                assert!(
+                    !prev.contains("╰──"),
+                    "{w}x{h}: 左边栏底边框应和最底一行对齐，不应高一行：{prev:?}"
+                );
+            }
         }
     }
 }
