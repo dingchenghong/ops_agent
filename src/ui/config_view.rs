@@ -1,9 +1,9 @@
-//! 配置界面（DeepSeek Token / 模型 / 集群参数）
+//! 设置弹窗（顶部菜单「设置」/ F2 打开）
 
-use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Modifier, Style};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Padding, Paragraph};
+use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph};
 use ratatui::Frame;
 
 use super::theme::*;
@@ -12,6 +12,7 @@ use crate::app::{App, FieldKind, F_AUTO_APPROVE};
 use crate::config::mask_secret;
 
 const LABEL_W: usize = 22;
+const SEL_BG: Color = Color::Rgb(36, 44, 56);
 
 fn pad_label(label: &str) -> String {
     let w = display_width(label);
@@ -21,54 +22,48 @@ fn pad_label(label: &str) -> String {
     format!("{label}{}", " ".repeat(LABEL_W - w))
 }
 
-pub fn draw(frame: &mut Frame, app: &mut App) {
-    let [head, body, info, foot] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(6),
-        Constraint::Length(5),
-        Constraint::Length(1),
-    ])
-    .areas(frame.area());
-
-    draw_head(frame, app, head);
-    draw_fields(frame, app, body);
-    draw_info(frame, app, info);
-    draw_foot(frame, app, foot);
+fn centered(area: Rect, w: u16, h: u16) -> Rect {
+    let w = w.min(area.width);
+    let h = h.min(area.height);
+    Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    }
 }
 
-fn draw_head(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let left = Line::from(vec![
-        Span::styled("⚙ 设置", strong(ACCENT)),
-        Span::styled("  ·  ", dim()),
-        Span::styled(app.db.file().display().to_string(), dim()),
-    ]);
-    let right = Line::from(vec![
-        Span::styled(
-            if app.cfg.has_key() { "Token 已配置" } else { "Token 未配置" },
-            Style::new().fg(if app.cfg.has_key() { OK } else { ERR }),
-        ),
-        Span::styled("  ", base()),
-    ]);
-    let rw = right.width() as u16;
-    let [l, r] = Layout::horizontal([Constraint::Min(0), Constraint::Length(rw)]).areas(area);
-    frame.render_widget(Paragraph::new(left), l);
-    frame.render_widget(Paragraph::new(right), r);
-}
+pub fn draw_modal(frame: &mut Frame, app: &mut App) {
+    let area = frame.area();
+    let w = area.width.saturating_sub(6).min(92).max(46);
+    let h = area.height.saturating_sub(4).min(26).max(12);
+    let rect = centered(area, w, h);
 
-fn draw_fields(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
+    frame.render_widget(Clear, rect);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(block_border(true))
-        .title(Line::from(Span::styled(" 连接与运行参数 ", strong(ACCENT))))
+        .border_style(Style::new().fg(ACCENT))
+        .title(Line::from(vec![
+            Span::styled(" 设置 ", strong(ACCENT)),
+            Span::styled(" 配置写入 SQLite 的 settings 表", dim()),
+        ]))
+        .title_bottom(Line::from(Span::styled(" Enter 确认并保存 · Esc 关闭 ", dim())))
         .padding(Padding::new(1, 1, 0, 0));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.height == 0 || inner.width == 0 {
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    if inner.height < 6 || inner.width < 24 {
         return;
     }
 
+    let [fields_area, info_area] =
+        Layout::vertical([Constraint::Min(5), Constraint::Length(5)]).areas(inner);
+    draw_fields(frame, app, fields_area);
+    draw_info(frame, app, info_area);
+}
+
+fn draw_fields(frame: &mut Frame, app: &mut App, area: Rect) {
     let rows = app.form.fields.len();
-    let view_h = inner.height as usize;
+    let view_h = area.height as usize;
     let offset = if app.form.idx >= view_h {
         app.form.idx + 1 - view_h
     } else {
@@ -100,16 +95,20 @@ fn draw_fields(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         spans.push(Span::styled("  ", base()));
 
         let used = 2 + LABEL_W + 2;
-        let avail = (inner.width as usize).saturating_sub(used);
+        let avail = (area.width as usize).saturating_sub(used);
 
         if editing {
             let buf = app.form.buffer.clone();
-            spans.push(Span::styled(
-                clip(&buf, avail),
-                Style::new().fg(ACCENT).bg(CODE_BG),
-            ));
-            let x = inner.x + (used + display_width(&buf)).min(inner.width.saturating_sub(1) as usize) as u16;
-            cursor = Some((x, inner.y + (i - offset) as u16));
+            let style = if app.form.sel_all {
+                // Ctrl+A 全选：整段高亮，按 Backspace 可一键清空
+                Style::new().fg(Color::White).bg(SELECT_BG)
+            } else {
+                Style::new().fg(ACCENT).bg(CODE_BG)
+            };
+            spans.push(Span::styled(clip(&buf, avail), style));
+            let x = area.x
+                + (used + display_width(&buf)).min(area.width.saturating_sub(1) as usize) as u16;
+            cursor = Some((x, area.y + (i - offset) as u16));
         } else {
             let (text, style) = match field.kind {
                 FieldKind::Secret => {
@@ -144,74 +143,54 @@ fn draw_fields(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
 
         let mut line = Line::from(spans);
         if selected {
-            line = line.style(Style::new().bg(ratatui::style::Color::Rgb(34, 40, 50)));
+            line = line.style(Style::new().bg(SEL_BG));
         }
         lines.push(line);
     }
 
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines), area);
     if let Some((x, y)) = cursor {
         frame.set_cursor_position((x, y));
     }
 }
 
-fn draw_info(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+fn draw_info(frame: &mut Frame, app: &App, area: Rect) {
     let hint = app.form.current().hint;
-    let secret_state = if app.cfg.effective_key().is_empty() {
-        Span::styled("未配置", Style::new().fg(ERR))
+    let (key_text, key_style) = if app.cfg.effective_key().is_empty() {
+        ("未配置", Style::new().fg(ERR))
     } else {
-        Span::styled("已就绪", Style::new().fg(OK))
+        ("已就绪", Style::new().fg(OK))
     };
+    let auto = app.form.fields[F_AUTO_APPROVE].value.eq_ignore_ascii_case("true");
 
     let text = vec![
         Line::from(vec![
             Span::styled(" 说明 ", strong(ACCENT)),
-            Span::styled(hint, dim()),
+            Span::styled(clip(hint, (area.width as usize).saturating_sub(8)), dim()),
         ]),
         Line::from(vec![
             Span::styled(" Token ", dim()),
-            secret_state,
+            Span::styled(key_text, key_style),
+            Span::styled("　·　留空读环境变量 DEEPSEEK_API_KEY", dim()),
+        ]),
+        Line::from(vec![
+            Span::styled(" 存储 ", dim()),
             Span::styled(
-                "   ·   留空则读取环境变量 DEEPSEEK_API_KEY　·　保存后写入 SQLite 的 settings 表（回车自动保存）",
-                dim(),
+                clip(&app.db.file().display().to_string(), (area.width as usize).saturating_sub(8)),
+                Style::new().fg(TEXT),
             ),
         ]),
         Line::from(vec![
             Span::styled(" 提示 ", dim()),
             Span::styled(
-                if app.form.fields[F_AUTO_APPROVE].value.eq_ignore_ascii_case("true") {
-                    "「跳过操作确认」已开启，Agent 会直接执行命令，请务必只在测试环境使用"
+                if auto {
+                    "「跳过操作确认」已开启，Agent 会直接执行命令（仅建议测试环境）"
                 } else {
-                    "涉及修改系统的操作（执行命令、写文件、改集群）都会弹窗让你确认"
+                    "涉及修改系统的操作都会弹窗让你确认"
                 },
-                if app.form.fields[F_AUTO_APPROVE].value.eq_ignore_ascii_case("true") {
-                    Style::new().fg(WARN)
-                } else {
-                    Style::new().fg(TEXT)
-                },
+                if auto { Style::new().fg(WARN) } else { dim() },
             ),
         ]),
     ];
-    frame.render_widget(
-        Paragraph::new(text).wrap(ratatui::widgets::Wrap { trim: true }),
-        area,
-    );
-}
-
-fn draw_foot(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let w = area.width as usize;
-    if let Some(t) = app.active_toast() {
-        let style = if t.error { Style::new().fg(ERR) } else { Style::new().fg(OK) };
-        frame.render_widget(
-            Paragraph::new(Span::styled(clip(&t.text, w), style)),
-            area,
-        );
-        return;
-    }
-    let hint = if app.form.editing {
-        " 输入中：Enter 确认 · Esc 取消 · Tab 跳到下一项 · Ctrl+U 清空"
-    } else {
-        " ↑↓ 选择 · Enter/空格 编辑或切换 · Ctrl+S 保存 · Ctrl+T 测试连接 · Ctrl+R 还原 · Esc 返回"
-    };
-    frame.render_widget(Paragraph::new(Span::styled(clip(hint, w), dim())), area);
+    frame.render_widget(Paragraph::new(text), area);
 }

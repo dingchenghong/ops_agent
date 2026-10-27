@@ -35,8 +35,8 @@ pub enum AgentEvent {
     ToolResult { id: String, name: String, output: String, ok: bool },
     Info(String),
     Error(String),
-    /// 当前会话切换（新建 / 清空后）
-    SessionChanged { id: i64 },
+    /// 当前会话切换：reset=true 表示界面需要清空（新建 / 清空会话）
+    SessionChanged { id: i64, reset: bool },
     /// 整轮结束（可以接受下一次输入）
     TurnDone,
 }
@@ -48,6 +48,7 @@ pub enum UiCommand {
     Cancel,
     Clear,
     NewSession,
+    SwitchSession(i64),
     ListSessions,
     UpdateConfig(Box<Config>),
     TestConnection { api_key: String, base_url: String },
@@ -124,6 +125,10 @@ impl AgentHandle {
 
     pub fn list_sessions(&self) {
         let _ = self.cmd.send(UiCommand::ListSessions);
+    }
+
+    pub fn switch_session(&self, id: i64) {
+        let _ = self.cmd.send(UiCommand::SwitchSession(id));
     }
 
     pub fn update_config(&self, cfg: &Config) {
@@ -228,7 +233,7 @@ impl Session {
                 if let Err(e) = self.db.clear_messages(self.session_id).await {
                     let _ = self.evt.send(AgentEvent::Error(format!("清空历史失败：{e:#}")));
                 }
-                let _ = self.evt.send(AgentEvent::SessionChanged { id: self.session_id });
+                let _ = self.evt.send(AgentEvent::SessionChanged { id: self.session_id, reset: true });
                 true
             }
             UiCommand::NewSession => {
@@ -237,12 +242,30 @@ impl Session {
                 match self.db.create_session("新会话", &self.cfg.model).await {
                     Ok(id) => {
                         self.session_id = id;
-                        let _ = self.evt.send(AgentEvent::SessionChanged { id });
+                        let _ = self.evt.send(AgentEvent::SessionChanged { id, reset: true });
                     }
                     Err(e) => {
                         let _ = self
                             .evt
                             .send(AgentEvent::Error(format!("新建会话失败：{e:#}")));
+                    }
+                }
+                true
+            }
+            UiCommand::SwitchSession(id) => {
+                match self.db.load_messages(id).await {
+                    Ok(msgs) => {
+                        self.history = history_from_stored(&msgs);
+                        self.session_id = id;
+                        self.queued = None;
+                        let _ = self
+                            .evt
+                            .send(AgentEvent::SessionChanged { id, reset: false });
+                    }
+                    Err(e) => {
+                        let _ = self
+                            .evt
+                            .send(AgentEvent::Error(format!("切换会话失败：{e:#}")));
                     }
                 }
                 true

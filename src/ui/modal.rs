@@ -1,4 +1,4 @@
-//! 弹窗：操作确认 / 帮助
+//! 弹窗：关于 / 操作确认
 
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -57,6 +57,144 @@ fn wrapped_count(text: &str, width: usize) -> usize {
         .max(1)
 }
 
+/// 「关于」弹窗：软件说明 + 快捷键 + 能力 + 安全
+pub fn about(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    let w = area.width.saturating_sub(8).min(104).max(44);
+    let inner_w = w.saturating_sub(6) as usize;
+    let key_w = 30usize.min(inner_w.saturating_sub(20));
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    section(&mut lines, "关于 OpsAgent");
+    let intro: [(&str, String); 5] = [
+        (
+            "是什么",
+            "给 Linux / Kubernetes 运维人员用的 AI Agent，能真的执行命令、改配置、管理集群"
+                .to_string(),
+        ),
+        ("技术栈", "Rust + ratatui（TUI）+ DeepSeek（OpenAI 兼容接口）".to_string()),
+        ("版本", env!("CARGO_PKG_VERSION").to_string()),
+        ("数据", app.db.file().display().to_string()),
+        ("模型", app.cfg.model.clone()),
+    ];
+    for (k, v) in intro.iter() {
+        kv(&mut lines, k, v, key_w, inner_w);
+    }
+
+    lines.push(Line::from(""));
+    section(&mut lines, "快捷键");
+    for (k, v) in [
+        ("Enter", "发送消息"),
+        ("Ctrl+J / Shift+Enter", "输入换行（可写多行命令）"),
+        ("Ctrl+Shift+V", "粘贴（多行内容整体插入，不会自动发送）"),
+        ("Tab", "在左侧会话栏与输入框之间切换"),
+        ("Ctrl+A", "全选输入框内容（全选后 Backspace 即清空）"),
+        ("Ctrl+C", "复制选中内容到系统剪贴板；无选区时退出程序"),
+        ("Ctrl+U", "清空输入框"),
+        ("Ctrl+Shift+V / Shift+Insert", "粘贴（终端快捷键，Ctrl+V 不会交给程序）"),
+        ("Ctrl+B / 点 ☰", "收起或展开左侧会话栏"),
+        ("Alt+↑ / Alt+↓", "调整输入框高度"),
+        ("鼠标拖动", "拖左栏右边界改宽度，拖输入框上边框改高度；悬停时分隔条高亮、指针变形"),
+        ("↑ / ↓", "会话栏内选择 / 输入框内翻历史"),
+        ("Esc", "取消任务、关闭弹窗、清空输入"),
+        ("PgUp / PgDn", "滚动对话"),
+        ("Ctrl+L", "清空当前会话"),
+        ("F1 / Ctrl+H", "打开本窗口"),
+        ("F2 / Ctrl+K", "打开设置"),
+        ("Ctrl+C", "退出程序"),
+    ] {
+        kv(&mut lines, k, v, key_w, inner_w);
+    }
+
+    lines.push(Line::from(""));
+    section(&mut lines, "斜杠命令");
+    for (k, v) in [
+        ("/new", "新建会话（旧会话仍保存在数据库里）"),
+        ("/sessions", "查看最近的会话列表"),
+        ("/clear", "清空当前会话的消息与上下文"),
+        ("/settings", "打开设置"),
+        ("/quit", "退出程序"),
+    ] {
+        kv(&mut lines, k, v, key_w, inner_w);
+    }
+
+    lines.push(Line::from(""));
+    section(&mut lines, "能做什么");
+    for (k, v) in [
+        ("run_shell", "执行任意 shell 命令：巡检、排障、systemctl、journalctl、docker…"),
+        ("system_info", "系统总览 / 磁盘 / 内存 / CPU / 进程 / 网络 / 服务 / 日志"),
+        ("service_manage", "systemd 服务查询与启停（启停需确认）"),
+        ("kubectl", "集群查询、describe、logs、apply、scale、rollout（写操作需确认）"),
+        ("read_file / write_file", "查看配置、落盘 YAML（写入需确认）"),
+    ] {
+        kv(&mut lines, k, v, key_w, inner_w);
+    }
+
+    lines.push(Line::from(""));
+    section(&mut lines, "安全机制");
+    for v in [
+        "所有会改变系统的工具调用都会弹窗确认，按 y 才会执行",
+        "mkfs、dd of=/dev/*、rm -rf / 等不可逆命令被硬性拦截",
+        "配置与会话保存在本地 SQLite：~/.local/share/ops-agent/ops-agent.db",
+        "对话内容会发送到 DeepSeek 接口，请勿在其中粘贴敏感凭据",
+    ] {
+        for (i, l) in wrap_plain(v, inner_w.saturating_sub(6)).iter().enumerate() {
+            if i == 0 {
+                lines.push(Line::from(vec![
+                    Span::styled("  • ", Style::new().fg(ACCENT)),
+                    Span::styled(l.clone(), dim()),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled("    ", base()),
+                    Span::styled(l.clone(), dim()),
+                ]));
+            }
+        }
+    }
+
+    let view_guess = lines.len() as u16;
+    let need = view_guess + 2;
+    let h = need.clamp(10, area.height.saturating_sub(3).max(10));
+    let rect = centered_exact(area, w, h);
+
+    frame.render_widget(Clear, rect);
+    let inner = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(ACCENT))
+        .title(Line::from(Span::styled(" 关于 ", strong(ACCENT))))
+        .title_bottom(Line::from(Span::styled(" Esc 关闭 ", dim())))
+        .padding(Padding::new(2, 2, 0, 0))
+        .inner(rect);
+
+    let view = inner.height as usize;
+    let total = lines.len();
+    let max_scroll = total.saturating_sub(view);
+    let scroll = app.about_scroll.min(max_scroll);
+
+    // 滚动进度放进边框标题，避免覆盖边框
+    let mut block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(ACCENT))
+        .title(Line::from(Span::styled(" 关于 ", strong(ACCENT))))
+        .title_bottom(Line::from(Span::styled(" Esc 关闭 ", dim())))
+        .padding(Padding::new(2, 2, 0, 0));
+    if total > view {
+        block = block.title_bottom(
+            Line::from(Span::styled(
+                format!(" ↑↓/PgUp/PgDn 滚动 {}/{} ", scroll + 1, max_scroll + 1),
+                dim(),
+            ))
+            .right_aligned(),
+        );
+    }
+    frame.render_widget(block, rect);
+
+    let shown: Vec<Line> = lines.into_iter().skip(scroll).take(view).collect();
+    frame.render_widget(Paragraph::new(shown), inner);
+}
+
 pub fn approval(frame: &mut Frame, app: &App) {
     let Some(appr) = app.approval.as_ref() else {
         return;
@@ -73,7 +211,7 @@ pub fn approval(frame: &mut Frame, app: &App) {
         .border_type(BorderType::Double)
         .border_style(Style::new().fg(WARN))
         .title(Line::from(Span::styled(
-            " ⚠ 需要你确认 ",
+            " ! 需要你确认 ",
             Style::new().fg(WARN).add_modifier(Modifier::BOLD),
         )))
         .padding(Padding::new(1, 1, 0, 0));
@@ -89,13 +227,12 @@ pub fn approval(frame: &mut Frame, app: &App) {
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("⚙ ", Style::new().fg(TOOL)),
+            Span::styled("» ", Style::new().fg(TOOL)),
             Span::styled(appr.name.clone(), strong(TOOL)),
         ])),
         title_area,
     );
 
-    // 预览区：按宽度自行换行，超出高度则截断
     let max_rows = body_area.height as usize;
     let mut lines: Vec<Line<'static>> = Vec::new();
     for raw in appr.preview.lines() {
@@ -128,131 +265,9 @@ pub fn approval(frame: &mut Frame, app: &App) {
             Span::styled(" 拒绝", dim()),
         ]),
         Line::from(Span::styled(
-            "拒绝不会中断对话，Agent 会改为给你可直接执行的命令",
+            "拒绝后不会中断对话，Agent 会改为给出可直接执行的命令",
             dim(),
         )),
     ];
     frame.render_widget(Paragraph::new(hints).alignment(Alignment::Center), hint_area);
-}
-
-pub fn help(frame: &mut Frame, app: &App) {
-    let area = frame.area();
-    let w = area.width.saturating_sub(8).min(104).max(44);
-    // 边框 2 + 左右 padding 4
-    let inner_w = w.saturating_sub(6) as usize;
-    let key_w = 30usize.min(inner_w.saturating_sub(20));
-
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
-    section(&mut lines, "快捷键");
-    for (k, v) in [
-        ("Enter", "发送消息"),
-        ("Ctrl+J / Shift+Enter", "输入换行（多行命令）"),
-        ("Esc", "取消正在进行的任务 / 清空输入框"),
-        ("↑ / ↓", "浏览历史输入"),
-        ("PgUp / PgDn", "滚动对话（Ctrl+Home 回到顶部，Ctrl+End 回到底部）"),
-        ("Ctrl+L", "清空当前会话与 Agent 上下文"),
-        ("F1 / Ctrl+H", "打开本帮助"),
-        ("F2 / Ctrl+K", "打开配置（API Token、模型、k8s 上下文）"),
-        ("Ctrl+C", "退出程序"),
-    ] {
-        kv(&mut lines, k, v, key_w, inner_w);
-    }
-
-    lines.push(Line::from(""));
-    section(&mut lines, "斜杠命令");
-    for (k, v) in [
-        ("/new", "新建会话（旧会话仍保存在数据库里）"),
-        ("/sessions", "查看最近的会话列表"),
-        ("/clear", "清空当前会话的消息与上下文"),
-        ("/config", "打开配置界面"),
-        ("/quit", "退出程序"),
-    ] {
-        kv(&mut lines, k, v, key_w, inner_w);
-    }
-
-    lines.push(Line::from(""));
-    section(&mut lines, "能做什么");
-    for (k, v) in [
-        ("run_shell", "执行任意 shell 命令：巡检、排障、systemctl、journalctl、docker…"),
-        ("system_info", "系统总览 / 磁盘 / 内存 / CPU / 进程 / 网络 / 服务 / 日志"),
-        ("service_manage", "systemd 服务查询与启停（启停需确认）"),
-        ("kubectl", "集群查询、describe、logs、apply、scale、rollout（写操作需确认）"),
-        ("read_file / write_file", "查看配置、落盘 YAML（写入需确认）"),
-        ("list_dir", "列出目录内容"),
-    ] {
-        kv(&mut lines, k, v, key_w, inner_w);
-    }
-
-    lines.push(Line::from(""));
-    section(&mut lines, "安全机制");
-    for v in [
-        "所有会改变系统的工具调用都会弹窗确认，按 y 才会执行",
-        "mkfs、dd of=/dev/*、rm -rf / 等不可逆命令被硬性拦截",
-        "配置与会话保存在 ~/.local/share/ops-agent/ops-agent.db（SQLite，权限 600）",
-        "对话内容会发送到 DeepSeek 接口，请勿在其中粘贴敏感凭据",
-    ] {
-        for (i, l) in wrap_plain(v, inner_w.saturating_sub(6))
-            .iter()
-            .enumerate()
-        {
-            if i == 0 {
-                lines.push(Line::from(vec![
-                    Span::styled("  • ", Style::new().fg(ACCENT)),
-                    Span::styled(l.clone(), dim()),
-                ]));
-            } else {
-                lines.push(Line::from(vec![
-                    Span::styled("    ", base()),
-                    Span::styled(l.clone(), dim()),
-                ]));
-            }
-        }
-    }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("  当前模型：", dim()),
-        Span::styled(app.cfg.model.clone(), Style::new().fg(ASSISTANT)),
-        Span::styled("　跳过确认：", dim()),
-        Span::styled(
-            if app.cfg.auto_approve_all { "是（危险）" } else { "否" },
-            Style::new().fg(if app.cfg.auto_approve_all { ERR } else { OK }),
-        ),
-    ]));
-
-    // 高度自适应内容（边框 2 行）
-    let need = lines.len() as u16 + 3;
-    let h = need.clamp(10, area.height.saturating_sub(2).max(10));
-    let rect = centered_exact(area, w, h);
-
-    frame.render_widget(Clear, rect);
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(ACCENT))
-        .title(Line::from(Span::styled(" 帮助 / 快捷键 ", strong(ACCENT))))
-        .title_bottom(Line::from(Span::styled(" Esc 关闭 ", dim())))
-        .padding(Padding::new(2, 2, 0, 0));
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-
-    let view = inner.height as usize;
-    let total = lines.len();
-    let max_scroll = total.saturating_sub(view);
-    let scroll = app.help_scroll.min(max_scroll);
-    let shown: Vec<Line> = lines.into_iter().skip(scroll).take(view).collect();
-    frame.render_widget(Paragraph::new(shown), inner);
-
-    if total > view {
-        let hint = format!(" ↑↓ / PgUp PgDn 滚动（{}/{}）· Esc 关闭 ", scroll + 1, max_scroll + 1);
-        let area2 = Rect {
-            y: rect.y + rect.height.saturating_sub(1),
-            height: 1,
-            ..rect
-        };
-        frame.render_widget(
-            Paragraph::new(Span::styled(hint, dim())).alignment(Alignment::Right),
-            area2,
-        );
-    }
 }

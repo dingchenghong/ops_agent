@@ -2,7 +2,7 @@
 name = "ops-agent"
 version = "0.1.0"
 edition = "2021"
-description = "面向 Linux 运维人员的 AI Agent（TUI），接入 DeepSeek，可管理本机与 Kubernetes 集群"
+description = "面向 Linux 运维人员的 AI Agent(TUI), 接入 DeepSeek, 可管理本机与 Kubernetes 集群"
 license = "MIT"
 
 [dependencies]

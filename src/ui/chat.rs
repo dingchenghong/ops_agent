@@ -1,6 +1,6 @@
-//! 聊天主界面
+//! 右侧主区域：顶部菜单栏、对话内容、输入框、状态行
 
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -9,76 +9,73 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use super::theme::*;
-use super::util::{clip, cursor_in, display_width, wrap_layout, wrap_plain};
-use crate::app::{App, Display, Status, ToolState};
+use super::util::{clip, cursor_in, display_width, sanitize, wrap_layout, wrap_plain};
+use crate::app::{App, Display, Overlay, Status, ToolState};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-pub fn draw(frame: &mut Frame, app: &mut App) {
-    let [header, body, input_area, footer] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(3),
-        Constraint::Length(4),
-        Constraint::Length(1),
-    ])
-    .areas(frame.area());
-
-    draw_header(frame, app, header);
-    draw_messages(frame, app, body);
-    draw_input(frame, app, input_area);
-    draw_footer(frame, app, footer);
-}
 
 fn tick(app: &App) -> usize {
     (app.started.elapsed().as_millis() / 120) as usize % SPINNER.len()
 }
 
-fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
-    let mut left = vec![
-        Span::styled("◆ OpsAgent", strong(ACCENT)),
-        Span::styled("  ·  ", dim()),
-        Span::styled(app.cfg.model.clone(), Style::new().fg(ASSISTANT)),
-    ];
-    if !app.cfg.kubectl_context.trim().is_empty() {
-        left.push(Span::styled("  ·  ", dim()));
-        left.push(Span::styled(
-            format!("ctx {}", app.cfg.kubectl_context),
-            Style::new().fg(TOOL),
-        ));
-    }
-    left.push(Span::styled("  ·  ", dim()));
-    left.push(Span::styled(
-        format!("ns {}", app.cfg.namespace()),
-        Style::new().fg(TOOL),
-    ));
-    if app.cfg.auto_approve_all {
-        left.push(Span::styled("  ·  ", dim()));
-        left.push(Span::styled("跳过确认", Style::new().fg(WARN)));
-    }
-    left.push(Span::styled("  ·  ", dim()));
-    left.push(Span::styled(format!("s#{}", app.session_id), dim()));
+/// 顶部菜单栏：☰ 侧边栏开关 + 品牌 + 设置 / 关于 + 右侧状态
+pub fn draw_menu(frame: &mut Frame, app: &App, lay: &super::layout::FrameLayout) {
+    let icon_style = if app.sidebar_open {
+        Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().fg(DIM)
+    };
+    // 注意：☰ 在 unicode-width 中是双宽字符，必须给 2 列
+    frame.render_widget(
+        Paragraph::new(Span::styled("☰", icon_style)),
+        Rect { x: lay.toggle_sidebar.x + 1, y: lay.menu.y, width: 2, height: 1 },
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled("◆ OpsAgent", strong(ACCENT))),
+        lay.brand,
+    );
 
+    let item = |active: bool| {
+        if active {
+            Style::new().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(TEXT)
+        }
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled("设置", item(app.overlay == Overlay::Settings))),
+        lay.settings,
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled("关于", item(app.overlay == Overlay::About))),
+        lay.about,
+    );
+
+    // 右侧状态
     let (icon, label, color) = match &app.status {
         Status::Idle => ("●", "就绪".to_string(), OK),
         Status::Thinking => (SPINNER[tick(app)], "思考中".to_string(), ACCENT),
         Status::Responding => (SPINNER[tick(app)], "生成中".to_string(), ACCENT),
         Status::Tool(name) => (SPINNER[tick(app)], format!("执行 {name}"), TOOL),
-        Status::WaitingApproval => ("⏸", "等待确认".to_string(), WARN),
+        Status::WaitingApproval => ("||", "等待确认".to_string(), WARN),
     };
     let right = Line::from(vec![
+        Span::styled(app.cfg.model.clone(), Style::new().fg(ASSISTANT)),
+        Span::styled("  ·  ", dim()),
+        Span::styled(
+            app.cfg.namespace().to_string(),
+            Style::new().fg(TOOL),
+        ),
+        Span::styled("  ", dim()),
         Span::styled(icon, Style::new().fg(color).add_modifier(Modifier::BOLD)),
         Span::raw(" "),
         Span::styled(label, Style::new().fg(color)),
-        Span::styled(format!("   #{} ", app.turns), dim()),
+        Span::styled(" ", base()),
     ]);
-
-    let right_w = right.width() as u16;
-    let [l, r] = Layout::horizontal([Constraint::Min(0), Constraint::Length(right_w)]).areas(area);
-    frame.render_widget(Paragraph::new(Line::from(left)), l);
-    frame.render_widget(Paragraph::new(right).alignment(Alignment::Right), r);
+    frame.render_widget(Paragraph::new(right).alignment(Alignment::Right), lay.menu);
 }
 
-fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect) {
+pub fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::new().padding(Padding::new(1, 1, 0, 0));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -159,7 +156,7 @@ fn welcome(out: &mut Vec<Line<'static>>, width: usize) {
     out.push(Line::from(""));
     out.push(Line::from(vec![
         Span::styled("  ", base()),
-        Span::styled("所有会修改系统的操作都需要你按键确认；F1 帮助 · F2 配置 Token", dim()),
+        Span::styled("Tab 切换侧边栏与输入框 · 左上「设置 / 关于」可点击", dim()),
     ]));
     out.push(Line::from(""));
 }
@@ -176,8 +173,9 @@ fn tool_color(state: ToolState) -> Color {
 fn render_message(out: &mut Vec<Line<'static>>, msg: &Display, width: usize) {
     match msg {
         Display::User(text) => {
+            let text = sanitize(text);
             out.push(Line::from(vec![Span::styled("❯ 你", strong(USER))]));
-            for l in wrap_plain(text, width.saturating_sub(2)) {
+            for l in wrap_plain(&text, width.saturating_sub(2)) {
                 out.push(Line::from(vec![
                     Span::styled("  ", base()),
                     Span::styled(l, Style::new().fg(USER)),
@@ -186,6 +184,8 @@ fn render_message(out: &mut Vec<Line<'static>>, msg: &Display, width: usize) {
             out.push(Line::from(""));
         }
         Display::Assistant { text, reasoning, streaming } => {
+            let text = sanitize(text);
+            let reasoning = sanitize(reasoning);
             let mut head = vec![Span::styled("◆ DeepSeek", strong(ASSISTANT))];
             if *streaming {
                 head.push(Span::styled(" …", dim()));
@@ -193,7 +193,7 @@ fn render_message(out: &mut Vec<Line<'static>>, msg: &Display, width: usize) {
             out.push(Line::from(head));
 
             if !reasoning.trim().is_empty() {
-                let lines = wrap_plain(reasoning, width.saturating_sub(4));
+                let lines = wrap_plain(&reasoning, width.saturating_sub(4));
                 let start = lines.len().saturating_sub(4);
                 for l in &lines[start..] {
                     out.push(Line::from(vec![
@@ -206,18 +206,18 @@ fn render_message(out: &mut Vec<Line<'static>>, msg: &Display, width: usize) {
             if text.trim().is_empty() && *streaming {
                 out.push(Line::from(vec![Span::styled("  ", base()), Span::styled("…", dim())]));
             } else {
-                render_markdown(out, text, width.saturating_sub(2));
+                render_markdown(out, &text, width.saturating_sub(2));
             }
             out.push(Line::from(""));
         }
         Display::ToolCall { name, preview, state } => {
             let color = tool_color(*state);
             out.push(Line::from(vec![
-                Span::styled("  ⚙ ", Style::new().fg(color)),
+                Span::styled("  » ", Style::new().fg(color)),
                 Span::styled(name.clone(), strong(color)),
                 Span::styled(format!("   {}", state.label()), dim()),
             ]));
-            let first = preview.lines().next().unwrap_or("").to_string();
+            let first = sanitize(preview.lines().next().unwrap_or(""));
             for l in wrap_plain(&first, width.saturating_sub(6)).into_iter().take(2) {
                 out.push(Line::from(vec![
                     Span::styled("    ", base()),
@@ -226,6 +226,7 @@ fn render_message(out: &mut Vec<Line<'static>>, msg: &Display, width: usize) {
             }
         }
         Display::ToolResult { output, ok, .. } => {
+            let output = sanitize(output);
             let head_color = if *ok { DIM } else { ERR };
             out.push(Line::from(vec![
                 Span::styled("    ╰ ", Style::new().fg(head_color)),
@@ -250,7 +251,8 @@ fn render_message(out: &mut Vec<Line<'static>>, msg: &Display, width: usize) {
             out.push(Line::from(""));
         }
         Display::Info(text) => {
-            for (i, l) in wrap_plain(text, width.saturating_sub(4)).into_iter().enumerate() {
+            let text = sanitize(text);
+            for (i, l) in wrap_plain(&text, width.saturating_sub(4)).into_iter().enumerate() {
                 if i == 0 {
                     out.push(Line::from(vec![
                         Span::styled("  · ", dim()),
@@ -265,7 +267,8 @@ fn render_message(out: &mut Vec<Line<'static>>, msg: &Display, width: usize) {
             }
         }
         Display::Error(text) => {
-            for (i, l) in wrap_plain(text, width.saturating_sub(4)).into_iter().enumerate() {
+            let text = sanitize(text);
+            for (i, l) in wrap_plain(&text, width.saturating_sub(4)).into_iter().enumerate() {
                 if i == 0 {
                     out.push(Line::from(vec![
                         Span::styled("  ✗ ", strong(ERR)),
@@ -323,7 +326,6 @@ fn render_markdown(out: &mut Vec<Line<'static>>, text: &str, width: usize) {
             continue;
         }
 
-        // 标题
         if trimmed.starts_with('#') {
             let content = trimmed.trim_start_matches('#').trim();
             for l in wrap_plain(content, width.saturating_sub(2)) {
@@ -335,7 +337,6 @@ fn render_markdown(out: &mut Vec<Line<'static>>, text: &str, width: usize) {
             continue;
         }
 
-        // 引用
         if let Some(rest) = trimmed.strip_prefix("> ") {
             for l in wrap_plain(rest, width.saturating_sub(4)) {
                 out.push(Line::from(vec![
@@ -346,7 +347,6 @@ fn render_markdown(out: &mut Vec<Line<'static>>, text: &str, width: usize) {
             continue;
         }
 
-        // 列表
         let (bullet, body) = if let Some(rest) = trimmed.strip_prefix("- ") {
             ("• ", rest.to_string())
         } else if let Some(rest) = trimmed.strip_prefix("* ") {
@@ -404,11 +404,17 @@ fn inline_spans(line: &str, base_style: Style) -> Vec<Span<'static>> {
     spans
 }
 
-fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
-    let active = !app.busy();
+pub fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
+    let active = !app.busy() && !app.focus_sidebar;
+    let hovered = app.hover_divider == Some(crate::app::Drag::Input);
+    let border_style = if hovered {
+        Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        block_border(active)
+    };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(block_border(active))
+        .border_style(border_style)
         .title(Line::from(vec![Span::styled(
             " ✎ 输入 ",
             Style::new().fg(if active { ACCENT } else { ACCENT_SOFT }),
@@ -431,7 +437,9 @@ fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
             Paragraph::new(Span::styled(clip(placeholder, width), dim())),
             inner,
         );
-        frame.set_cursor_position((inner.x, inner.y));
+        if active {
+            frame.set_cursor_position((inner.x, inner.y));
+        }
         return;
     }
 
@@ -441,20 +449,50 @@ fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
     let view_h = inner.height as usize;
     let offset = row.saturating_sub(view_h.saturating_sub(1));
 
+    // 选区（字节范围），用于把每行切成「前 / 选中 / 后」三段
+    let sel = app
+        .input
+        .selection()
+        .map(|(s, e)| (app.input.byte_at(s), app.input.byte_at(e)));
+
     let lines: Vec<Line> = layout
         .iter()
         .skip(offset)
         .take(view_h)
-        .map(|l| Line::from(Span::styled(l.text.clone(), base())))
+        .map(|l| {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            let hit = sel
+                .map(|(ss, se)| (ss.clamp(l.start, l.end), se.clamp(l.start, l.end)))
+                .filter(|(a, b)| a < b);
+            match hit {
+                Some((a, b)) => {
+                    let (ra, rb) = (a - l.start, b - l.start);
+                    if ra > 0 {
+                        spans.push(Span::styled(l.text[..ra].to_string(), base()));
+                    }
+                    spans.push(Span::styled(
+                        l.text[ra..rb].to_string(),
+                        Style::new().fg(Color::White).bg(SELECT_BG),
+                    ));
+                    if rb < l.text.len() {
+                        spans.push(Span::styled(l.text[rb..].to_string(), base()));
+                    }
+                }
+                None => spans.push(Span::styled(l.text.clone(), base())),
+            }
+            Line::from(spans)
+        })
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
 
-    let cy = inner.y + (row - offset) as u16;
-    let cx = inner.x + (col as u16).min(inner.width.saturating_sub(1));
-    frame.set_cursor_position((cx, cy));
+    if active {
+        let cy = inner.y + (row - offset) as u16;
+        let cx = inner.x + (col as u16).min(inner.width.saturating_sub(1));
+        frame.set_cursor_position((cx, cy));
+    }
 }
 
-fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
+pub fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let w = area.width as usize;
     if let Some(t) = app.active_toast() {
         let style = if t.error { Style::new().fg(ERR) } else { Style::new().fg(OK) };
@@ -467,12 +505,27 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         );
         return;
     }
+    if let Some(hover) = app.hover_hint() {
+        // 做成通栏高亮徽标，比一行小字更容易被看到
+        let text = format!(" {hover} ");
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                clip(&text, w),
+                Style::new()
+                    .fg(Color::Black)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            area,
+        );
+        return;
+    }
     let hint = if app.busy() {
         " Esc 取消当前任务 · Ctrl+C 退出".to_string()
     } else if app.cfg.auto_approve_all {
-        " ⚠ 已开启「跳过确认」，工具将直接执行 · F2 修改 · F1 帮助 · Ctrl+C 退出".to_string()
+        " ! 已开启「跳过确认」 · 设置 里可关闭 · Ctrl+C 退出".to_string()
     } else {
-        " F1 帮助 · F2 配置 · Ctrl+L 清空 · PgUp/PgDn 翻页 · Ctrl+C 退出".to_string()
+        " Tab 侧边栏 · Ctrl+A 全选 · Ctrl+C 复制 · Ctrl+U 清空 · F1 关于 · F2 设置".to_string()
     };
     let style = if app.cfg.auto_approve_all && !app.busy() {
         Style::new().fg(WARN)

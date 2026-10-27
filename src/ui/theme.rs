@@ -13,6 +13,8 @@ pub const WARN: Color = Color::Rgb(240, 190, 90);
 pub const DIM: Color = Color::Rgb(128, 134, 146);
 pub const TEXT: Color = Color::Rgb(216, 220, 228);
 pub const CODE_BG: Color = Color::Rgb(32, 37, 46);
+/// 输入框选区背景
+pub const SELECT_BG: Color = Color::Rgb(58, 82, 112);
 
 pub fn base() -> Style {
     Style::new().fg(TEXT)

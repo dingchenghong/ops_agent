@@ -3,19 +3,54 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
+use ratatui::layout::{Position, Rect};
 use ratatui::DefaultTerminal;
 
 use crate::agent::{AgentEvent, AgentHandle};
 use crate::config::{Config, DEFAULT_BASE_URL, DEFAULT_MODEL};
-use crate::db::{Db, StoredMessage};
+use crate::db::{Db, SessionInfo, StoredMessage};
 use crate::ui;
 use crate::ui::input::TextInput;
 
+/// 覆盖在主界面之上的弹窗
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Screen {
-    Chat,
-    Config,
+pub enum Overlay {
+    None,
+    Settings,
+    About,
+}
+
+/// 正在拖动的分隔条
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Drag {
+    /// 左右分栏（侧边栏宽度）
+    Sidebar,
+    /// 输入框上边框（输入框高度）
+    Input,
+}
+
+/// 终端指针形状（悬停到可拖动区域时切换）
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Pointer {
+    Default,
+    EwResize,
+    NsResize,
+}
+
+impl Pointer {
+    fn sequence(self) -> &'static str {
+        match self {
+            // OSC 22 设置鼠标指针形状（kitty / WezTerm / foot / Ghostty 等支持）
+            // CSI 2 SP q = 实心方块光标，比细线醒目
+            Pointer::EwResize => "\x1b]22;ew-resize\x1b\\\x1b[2 q",
+            Pointer::NsResize => "\x1b]22;ns-resize\x1b\\\x1b[2 q",
+            Pointer::Default => "\x1b]22;default\x1b\\\x1b[0 q",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -124,6 +159,10 @@ pub struct ConfigForm {
     pub idx: usize,
     pub editing: bool,
     pub buffer: String,
+    /// 本次编辑中用户是否已手动输入过（用于「粘贴直接替换原值」）
+    pub edited: bool,
+    /// 设置项里 Ctrl+A 全选（简化版：整段选中）
+    pub sel_all: bool,
 }
 
 impl ConfigForm {
@@ -132,7 +171,7 @@ impl ConfigForm {
             fields: vec![
                 FormField {
                     label: "DeepSeek API Token",
-                    hint: "在 platform.deepseek.com 创建。保存后写入配置文件（权限 600）；留空则读取环境变量 DEEPSEEK_API_KEY",
+                    hint: "在 platform.deepseek.com 创建。回车即写入 SQLite 的 settings 表；留空则读取环境变量 DEEPSEEK_API_KEY",
                     kind: FieldKind::Secret,
                     value: cfg.api_key.clone(),
                 },
@@ -194,6 +233,8 @@ impl ConfigForm {
             idx: 0,
             editing: false,
             buffer: String::new(),
+            edited: false,
+            sel_all: false,
         }
     }
 
@@ -216,6 +257,8 @@ impl ConfigForm {
         }
         self.buffer = self.current().value.clone();
         self.editing = true;
+        self.edited = false;
+        self.sel_all = false;
     }
 
     pub fn toggle(&mut self) {
@@ -253,6 +296,8 @@ impl ConfigForm {
         self.fields[idx].value = raw;
         self.editing = false;
         self.buffer.clear();
+        self.edited = false;
+        self.sel_all = false;
         Ok(())
     }
 
@@ -310,14 +355,34 @@ pub struct App {
     pub session_id: i64,
     /// 配置表单是否有未落盘的修改（避免被旧配置覆盖）
     pub form_dirty: bool,
-    pub screen: Screen,
+    pub overlay: Overlay,
+    /// 左侧会话列表（来自 SQLite）
+    pub sessions: Vec<SessionInfo>,
+    /// 侧边栏选中项：0 = 新对话，1..=n 对应 sessions
+    pub sidebar_idx: usize,
+    pub sidebar_scroll: usize,
+    /// 焦点是否在侧边栏
+    pub focus_sidebar: bool,
+    /// 最近一帧的终端尺寸（鼠标命中判定用）
+    pub size: (u16, u16),
+    /// 侧边栏宽度 / 是否展开 / 输入框高度（会持久化到 settings）
+    pub sidebar_width: u16,
+    pub sidebar_open: bool,
+    pub input_height: u16,
+    /// 正在拖动的分隔条
+    pub drag: Option<Drag>,
+    /// 鼠标当前悬停的可拖动分隔条
+    pub hover_divider: Option<Drag>,
+    /// 鼠标最近位置（用于把光标定位到分隔条上）
+    pub hover_pos: Option<(u16, u16)>,
+    /// 已经下发给终端的指针形状
+    pointer: Pointer,
     pub messages: Vec<Display>,
     pub input: TextInput,
     pub status: Status,
     pub scroll: usize,
     pub follow: bool,
-    pub help: bool,
-    pub help_scroll: usize,
+    pub about_scroll: usize,
     pub approval: Option<Approval>,
     pub form: ConfigForm,
     pub toast: Option<Toast>,
@@ -338,6 +403,36 @@ impl App {
         let need_key = !cfg.has_key();
         let form = ConfigForm::from(&cfg);
         let messages = display_from_stored(&restored);
+        let sessions = rt.block_on(db.list_sessions(200)).unwrap_or_default();
+        let sidebar_idx = sessions
+            .iter()
+            .position(|s| s.id == session_id)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+
+        // 界面偏好（侧边栏宽度、输入框高度）
+        let mut sidebar_width = crate::ui::layout::SIDEBAR_DEFAULT;
+        let mut sidebar_open = true;
+        let mut input_height = crate::ui::layout::INPUT_DEFAULT;
+        if let Ok(pairs) = rt.block_on(db.load_settings()) {
+            for (k, v) in pairs {
+                match k.as_str() {
+                    "ui_sidebar_width" => {
+                        if let Ok(w) = v.parse::<u16>() {
+                            sidebar_width = w;
+                        }
+                    }
+                    "ui_sidebar_open" => sidebar_open = v == "true",
+                    "ui_input_height" => {
+                        if let Ok(h) = v.parse::<u16>() {
+                            input_height = h;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         let mut app = Self {
             cfg,
             agent,
@@ -345,14 +440,25 @@ impl App {
             rt,
             session_id,
             form_dirty: false,
-            screen: Screen::Chat,
+            overlay: Overlay::None,
+            sessions,
+            sidebar_idx,
+            sidebar_scroll: 0,
+            focus_sidebar: false,
+            size: (0, 0),
+            sidebar_width,
+            sidebar_open,
+            input_height,
+            drag: None,
+            hover_divider: None,
+            hover_pos: None,
+            pointer: Pointer::Default,
             messages,
             input: TextInput::new(),
             status: Status::Idle,
             scroll: 0,
             follow: true,
-            help: false,
-            help_scroll: 0,
+            about_scroll: 0,
             approval: None,
             form,
             toast: None,
@@ -360,28 +466,45 @@ impl App {
             started: Instant::now(),
             turns: 0,
         };
+
         if app.db.is_memory() {
-            app.messages
-                .insert(0, Display::Error("数据库不可用：配置与会话本次运行不会保存".into()));
+            app.messages.insert(
+                0,
+                Display::Error("数据库不可用：配置与会话本次运行不会保存".into()),
+            );
         }
         if need_key {
-            app.screen = Screen::Config;
+            app.overlay = Overlay::Settings;
             app.toast_err("首次使用：填写 DeepSeek API Token，回车即保存");
         }
         app
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        let mut modal_state = (self.overlay, self.approval.is_some());
         while !self.quit {
             self.pump();
+            // 弹窗开关时整屏重绘，避免上一帧残留的错位字符
+            let now = (self.overlay, self.approval.is_some());
+            if now != modal_state {
+                let _ = terminal.clear();
+                modal_state = now;
+            }
             terminal.draw(|frame| ui::draw(frame, self))?;
+            self.sync_pointer();
             if event::poll(Duration::from_millis(30))? {
                 match event::read()? {
                     Event::Key(key) if key.kind != KeyEventKind::Release => self.on_key(key),
+                    Event::Mouse(m) => self.on_mouse(m),
+                    // 终端的括号粘贴（bracketed paste）会作为一个整体事件到达
+                    Event::Paste(text) => self.on_paste(text),
                     _ => {}
                 }
             }
         }
+        // 复原指针与光标形状，避免退出后终端残留
+        self.hover_divider = None;
+        self.sync_pointer();
         self.agent.shutdown();
         Ok(())
     }
@@ -477,17 +600,20 @@ impl App {
                 self.status = Status::Idle;
                 self.follow = true;
             }
-            AgentEvent::SessionChanged { id } => {
+            AgentEvent::SessionChanged { id, reset } => {
                 let switched = id != self.session_id;
                 self.session_id = id;
-                self.messages.clear();
-                self.close_assistant();
-                self.status = Status::Idle;
-                self.scroll = 0;
-                self.follow = true;
-                if switched {
-                    self.toast_ok(format!("已新建会话 #{id}（历史记录已保存）"));
+                if reset {
+                    self.messages.clear();
+                    self.close_assistant();
+                    self.status = Status::Idle;
+                    self.scroll = 0;
+                    self.follow = true;
+                    if switched {
+                        self.toast_ok(format!("已新建会话 #{id}（历史记录已保存）"));
+                    }
                 }
+                self.refresh_sessions();
             }
             AgentEvent::TurnDone => {
                 self.close_assistant();
@@ -495,6 +621,8 @@ impl App {
                 self.approval = None;
                 self.turns += 1;
                 self.follow = true;
+                // 会话标题/消息数可能已变化
+                self.refresh_sessions();
             }
         }
     }
@@ -521,32 +649,61 @@ impl App {
     fn on_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-        // 全局：Ctrl+C 退出
+        // 全局 Ctrl+C：有选中内容时复制，否则退出
         if ctrl && matches!(key.code, KeyCode::Char('c')) {
+            if self.copy_selection() {
+                return;
+            }
             self.quit = true;
             return;
         }
-
         if self.approval.is_some() {
             self.on_approval_key(key);
             return;
         }
-        if self.help {
-            match key.code {
-                KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('q') => self.help = false,
-                KeyCode::Up | KeyCode::PageUp => {
-                    self.help_scroll = self.help_scroll.saturating_sub(3)
-                }
-                KeyCode::Down | KeyCode::PageDown => self.help_scroll = self.help_scroll.saturating_add(3),
-                KeyCode::Home => self.help_scroll = 0,
-                _ => {}
+        match self.overlay {
+            Overlay::About => {
+                self.on_about_key(key);
+                return;
             }
+            Overlay::Settings => {
+                self.on_config_key(key);
+                return;
+            }
+            Overlay::None => {}
+        }
+        if self.focus_sidebar {
+            self.on_sidebar_key(key);
             return;
         }
+        self.on_chat_key(key);
+    }
 
-        match self.screen {
-            Screen::Chat => self.on_chat_key(key),
-            Screen::Config => self.on_config_key(key),
+    fn on_about_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('q') => self.overlay = Overlay::None,
+            KeyCode::Up | KeyCode::PageUp => {
+                self.about_scroll = self.about_scroll.saturating_sub(3)
+            }
+            KeyCode::Down | KeyCode::PageDown => {
+                self.about_scroll = self.about_scroll.saturating_add(3)
+            }
+            KeyCode::Home => self.about_scroll = 0,
+            _ => {}
+        }
+    }
+
+    fn on_sidebar_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Tab | KeyCode::Esc => self.focus_sidebar = false,
+            KeyCode::Up => self.sidebar_move(-1),
+            KeyCode::Down => self.sidebar_move(1),
+            KeyCode::Home => self.sidebar_idx = 0,
+            KeyCode::End => self.sidebar_idx = self.sessions.len(),
+            KeyCode::Enter => self.sidebar_activate(),
+            KeyCode::Char('n') if ctrl => self.new_session(),
+            _ => {}
         }
     }
 
@@ -579,6 +736,9 @@ impl App {
                 if self.busy() {
                     self.agent.cancel();
                     self.toast_ok("正在取消…");
+                } else if self.input.selection().is_some() {
+                    // 先取消选区，再清空
+                    self.input.clear_selection();
                 } else if !self.input.is_empty() {
                     self.input.clear();
                 }
@@ -586,23 +746,29 @@ impl App {
             KeyCode::Enter if !shift && !alt => self.submit(),
             KeyCode::Enter => self.input.insert_newline(),
             KeyCode::Char('j') if ctrl => self.input.insert_newline(),
-            KeyCode::F(1) => {
-                self.help = true;
-                self.help_scroll = 0;
-            }
-            KeyCode::Char('h') if ctrl => {
-                self.help = true;
-                self.help_scroll = 0;
-            }
-            KeyCode::F(2) => self.open_config(),
-            KeyCode::Char('k') if ctrl => self.open_config(),
+            KeyCode::Tab => self.focus_sidebar = true,
+            KeyCode::F(1) => self.open_about(),
+            KeyCode::Char('h') if ctrl => self.open_about(),
+            KeyCode::F(2) => self.open_settings(),
+            KeyCode::Char('k') if ctrl => self.open_settings(),
             KeyCode::Char('l') if ctrl => self.clear_chat(),
             KeyCode::Char('u') if ctrl => self.input.clear(),
+            KeyCode::Char('a') if ctrl => self.input.select_all(),
             KeyCode::Char('w') if ctrl => self.input.delete_word(),
+            KeyCode::Char('b') if ctrl => self.toggle_sidebar(),
+            KeyCode::Char('v') if ctrl => {
+                self.toast_err("请用 Ctrl+Shift+V 或 Shift+Insert 粘贴（终端不会把 Ctrl+V 交给程序）")
+            }
+            KeyCode::Up if alt => self.adjust_input_height(1),
+            KeyCode::Down if alt => self.adjust_input_height(-1),
             KeyCode::PageUp => self.scroll_up(10),
             KeyCode::PageDown => self.scroll_down(10),
             KeyCode::Up if ctrl => self.scroll_up(3),
             KeyCode::Down if ctrl => self.scroll_down(3),
+            KeyCode::Left if shift => self.input.left_extend(),
+            KeyCode::Right if shift => self.input.right_extend(),
+            KeyCode::Home if shift => self.input.home_extend(),
+            KeyCode::End if shift => self.input.end_extend(),
             KeyCode::Home if ctrl => {
                 self.scroll = 0;
                 self.follow = false;
@@ -647,12 +813,39 @@ impl App {
                     self.form.begin_edit();
                 }
                 KeyCode::Backspace => {
-                    self.form.buffer.pop();
+                    if self.form.sel_all {
+                        self.form.buffer.clear();
+                        self.form.sel_all = false;
+                    } else {
+                        self.form.buffer.pop();
+                    }
+                    self.form.edited = true;
                     self.form_dirty = true;
                 }
-                KeyCode::Char('u') if ctrl => self.form.buffer.clear(),
+                KeyCode::Char('u') if ctrl => {
+                    self.form.buffer.clear();
+                    self.form.sel_all = false;
+                    self.form.edited = true;
+                }
+                KeyCode::Char('a') if ctrl => {
+                    if !self.form.buffer.is_empty() {
+                        self.form.sel_all = true;
+                    }
+                }
+                KeyCode::Char('v') if ctrl => self.toast_err(
+                    "请用 Ctrl+Shift+V 或 Shift+Insert 粘贴（终端不会把 Ctrl+V 交给程序）",
+                ),
                 KeyCode::Char(c) if !ctrl => {
-                    self.form.buffer.push(c);
+                    let safe = crate::ui::util::sanitize_char(c);
+                    if safe.is_empty() {
+                        return;
+                    }
+                    if self.form.sel_all {
+                        self.form.buffer.clear();
+                        self.form.sel_all = false;
+                    }
+                    self.form.buffer.push_str(&safe);
+                    self.form.edited = true;
                     self.form_dirty = true;
                 }
                 _ => {}
@@ -665,7 +858,7 @@ impl App {
                 if self.form_dirty {
                     self.save_config();
                 }
-                self.screen = Screen::Chat;
+                self.overlay = Overlay::None;
             }
             KeyCode::Up | KeyCode::BackTab => self.form.prev(),
             KeyCode::Down | KeyCode::Tab => self.form.next(),
@@ -688,6 +881,170 @@ impl App {
         }
     }
 
+    /// 鼠标：菜单、新对话、会话条目、分隔条拖拽、滚动
+    fn on_mouse(&mut self, m: MouseEvent) {
+        if self.size.0 == 0 || self.size.1 == 0 {
+            return;
+        }
+        let lay = crate::ui::layout::compute(Rect::new(0, 0, self.size.0, self.size.1), self);
+        let pos = Position { x: m.column, y: m.row };
+        let hit = |r: Rect| r.contains(pos);
+
+        match m.kind {
+            MouseEventKind::Moved => self.update_hover(m.column, m.row),
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.update_hover(m.column, m.row);
+                if hit(lay.toggle_sidebar) {
+                    self.toggle_sidebar();
+                } else if hit(lay.settings) {
+                    self.open_settings();
+                } else if hit(lay.about) {
+                    self.open_about();
+                } else if self.sidebar_open && hit(lay.sidebar_divider) {
+                    self.drag = Some(Drag::Sidebar);
+                } else if hit(lay.input_divider) {
+                    self.drag = Some(Drag::Input);
+                } else if hit(lay.new_chat) {
+                    self.new_session();
+                } else if let Some((id, _)) = lay.session_items.iter().find(|(_, r)| hit(*r)) {
+                    let id = *id;
+                    self.switch_session(id);
+                } else if hit(lay.main) {
+                    // 点击右侧任意位置都把焦点交还输入框
+                    self.focus_sidebar = false;
+                }
+            }
+            // 拖动分隔条：实时改变宽度 / 高度
+            MouseEventKind::Drag(MouseButton::Left) => match self.drag {
+                Some(Drag::Sidebar) => {
+                    if m.column < crate::ui::layout::SIDEBAR_MIN {
+                        // 拖到最左边直接收起
+                        self.sidebar_open = false;
+                        self.drag = None;
+                        self.save_ui_prefs();
+                    } else {
+                        self.sidebar_width = m.column;
+                    }
+                }
+                Some(Drag::Input) => {
+                    // footer.y 是输入框的下边界
+                    let h = lay.footer.y.saturating_sub(m.row);
+                    self.input_height =
+                        h.clamp(crate::ui::layout::INPUT_MIN, crate::ui::layout::INPUT_MAX);
+                }
+                None => {}
+            },
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.drag.take().is_some() {
+                    self.save_ui_prefs();
+                    // 松开后按当前鼠标位置重新判定悬停
+                    self.update_hover(m.column, m.row);
+                }
+            }
+            MouseEventKind::ScrollUp if hit(lay.chat) => self.scroll_up(3),
+            MouseEventKind::ScrollDown if hit(lay.chat) => self.scroll_down(3),
+            _ => {}
+        }
+    }
+
+    /// 根据鼠标位置更新「可拖动」悬停状态
+    fn update_hover(&mut self, column: u16, row: u16) {
+        self.hover_pos = Some((column, row));
+        // 拖动过程中保持指针形状
+        if let Some(kind) = self.drag {
+            self.hover_divider = Some(kind);
+            return;
+        }
+        if self.size.0 == 0 || self.size.1 == 0 {
+            return;
+        }
+        let lay = crate::ui::layout::compute(Rect::new(0, 0, self.size.0, self.size.1), self);
+        let pos = Position { x: column, y: row };
+        self.hover_divider = if self.sidebar_open
+            && lay.sidebar_divider.width > 0
+            && lay.sidebar_divider.contains(pos)
+        {
+            Some(Drag::Sidebar)
+        } else if lay.input_divider.contains(pos) {
+            Some(Drag::Input)
+        } else {
+            None
+        };
+    }
+
+    /// 悬停在分隔条上时改变终端指针形状
+    fn sync_pointer(&mut self) {
+        let want = match self.hover_divider {
+            Some(Drag::Sidebar) => Pointer::EwResize,
+            Some(Drag::Input) => Pointer::NsResize,
+            None => Pointer::Default,
+        };
+        if want == self.pointer {
+            return;
+        }
+        self.pointer = want;
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let _ = out.write_all(want.sequence().as_bytes());
+        let _ = out.flush();
+    }
+
+    /// Ctrl+C：复制输入框选区（或设置项里的整个值）；返回是否复制了内容
+    fn copy_selection(&mut self) -> bool {
+        if self.overlay == Overlay::Settings && self.form.editing {
+            let text = self.form.buffer.clone();
+            if text.is_empty() {
+                return false;
+            }
+            osc52_copy(&text);
+            self.toast_ok(format!("已复制 {} 个字符到剪贴板", text.chars().count()));
+            return true;
+        }
+        if self.overlay != Overlay::None || self.approval.is_some() {
+            return false;
+        }
+        let Some(text) = self.input.selection_text() else {
+            return false;
+        };
+        if text.is_empty() {
+            return false;
+        }
+        osc52_copy(&text);
+        self.toast_ok(format!("已复制 {} 个字符到剪贴板", text.chars().count()));
+        true
+    }
+
+    /// 粘贴：按当前焦点插入，多行内容不会被误当成多次回车
+    fn on_paste(&mut self, text: String) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if text.is_empty() {
+            return;
+        }
+        // 弹窗/审批期间不接受粘贴
+        if self.approval.is_some() || self.overlay == Overlay::About {
+            return;
+        }
+        if self.overlay == Overlay::Settings {
+            if self.form.editing {
+                // 配置项都是单行值，去掉换行
+                let cleaned: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+                let cleaned = crate::ui::util::sanitize(cleaned.trim());
+                if self.form.sel_all || (!self.form.edited && !self.form.buffer.is_empty()) {
+                    // 全选 or 刚进入编辑就粘贴 → 替换原值
+                    self.form.buffer = cleaned;
+                } else {
+                    self.form.buffer.push_str(&cleaned);
+                }
+                self.form.sel_all = false;
+                self.form.edited = true;
+                self.form_dirty = true;
+            }
+            return;
+        }
+        self.focus_sidebar = false;
+        self.input.insert_str(&text);
+    }
+
     // ---------- 动作 ----------
 
     fn submit(&mut self) {
@@ -704,13 +1061,12 @@ impl App {
                 self.quit = true;
                 return;
             }
-            "/help" | "/?" => {
-                self.help = true;
-                self.help_scroll = 0;
+            "/help" | "/?" | "/about" => {
+                self.open_about();
                 return;
             }
-            "/config" => {
-                self.open_config();
+            "/settings" | "/config" => {
+                self.open_settings();
                 return;
             }
             "/clear" => {
@@ -722,20 +1078,15 @@ impl App {
                 return;
             }
             "/new" => {
-                if self.busy() {
-                    self.toast_err("正在处理任务，稍后再新建会话");
-                    return;
-                }
-                self.messages.clear();
-                self.agent.new_session();
+                self.new_session();
                 return;
             }
             _ => {}
         }
 
         if !self.cfg.has_key() {
-            self.toast_err("还没有配置 API Token，请先填写（F2）");
-            self.open_config();
+            self.toast_err("还没有配置 API Token，请先点「设置」填写");
+            self.open_settings();
             return;
         }
         if self.busy() {
@@ -759,12 +1110,107 @@ impl App {
         self.toast_ok("已清空会话");
     }
 
-    fn open_config(&mut self) {
+    pub fn open_settings(&mut self) {
         // 表单里有未保存的修改时不要覆盖，否则用户刚输入的 Token 会被冲掉
         if !self.form_dirty {
             self.form = ConfigForm::from(&self.cfg);
         }
-        self.screen = Screen::Config;
+        self.overlay = Overlay::Settings;
+    }
+
+    pub fn open_about(&mut self) {
+        self.overlay = Overlay::About;
+        self.about_scroll = 0;
+    }
+
+    /// 收起 / 展开左侧会话栏
+    pub fn toggle_sidebar(&mut self) {
+        self.sidebar_open = !self.sidebar_open;
+        if !self.sidebar_open {
+            self.focus_sidebar = false;
+        }
+        self.save_ui_prefs();
+    }
+
+    /// 调整输入框高度（含边框），+1 变高
+    pub fn adjust_input_height(&mut self, delta: i16) {
+        let h = self.input_height as i16 + delta;
+        self.input_height = h.clamp(
+            crate::ui::layout::INPUT_MIN as i16,
+            crate::ui::layout::INPUT_MAX as i16,
+        ) as u16;
+        self.save_ui_prefs();
+    }
+
+    /// 记住界面偏好（侧边栏宽度 / 是否展开 / 输入框高度）
+    fn save_ui_prefs(&mut self) {
+        let pairs = vec![
+            ("ui_sidebar_width".to_string(), self.sidebar_width.to_string()),
+            ("ui_sidebar_open".to_string(), self.sidebar_open.to_string()),
+            ("ui_input_height".to_string(), self.input_height.to_string()),
+        ];
+        let _ = self.rt.block_on(self.db.save_settings(&pairs));
+    }
+
+    /// 重新从数据库读取会话列表
+    pub fn refresh_sessions(&mut self) {
+        if let Ok(list) = self.rt.block_on(self.db.list_sessions(200)) {
+            self.sessions = list;
+        }
+        let current = self
+            .sessions
+            .iter()
+            .position(|s| s.id == self.session_id)
+            .map(|i| i + 1);
+        if let Some(idx) = current {
+            self.sidebar_idx = idx;
+        }
+        self.sidebar_idx = self.sidebar_idx.min(self.sessions.len());
+    }
+
+    fn sidebar_move(&mut self, delta: isize) {
+        let max = self.sessions.len() as isize;
+        let cur = self.sidebar_idx.min(self.sessions.len()) as isize;
+        self.sidebar_idx = (cur + delta).clamp(0, max) as usize;
+    }
+
+    fn sidebar_activate(&mut self) {
+        if self.sidebar_idx == 0 {
+            self.new_session();
+        } else if let Some(s) = self.sessions.get(self.sidebar_idx - 1) {
+            let id = s.id;
+            self.switch_session(id);
+        }
+    }
+
+    fn new_session(&mut self) {
+        if self.busy() {
+            self.toast_err("正在处理任务，稍后再新建会话");
+            return;
+        }
+        self.focus_sidebar = false;
+        self.agent.new_session();
+    }
+
+    fn switch_session(&mut self, id: i64) {
+        if self.busy() {
+            self.toast_err("当前任务进行中，稍后再切换会话");
+            return;
+        }
+        match self.rt.block_on(self.db.load_messages(id)) {
+            Ok(stored) => {
+                self.messages = display_from_stored(&stored);
+                self.session_id = id;
+                self.scroll = 0;
+                self.follow = true;
+                self.status = Status::Idle;
+                self.focus_sidebar = false;
+                self.agent.switch_session(id);
+                self.refresh_sessions();
+                self.toast_ok(format!("已切换到会话 #{id}"));
+            }
+            Err(e) => self.toast_err(format!("加载会话失败：{e:#}")),
+        }
     }
 
     fn save_config(&mut self) {
@@ -820,6 +1266,15 @@ impl App {
         self.scroll = self.scroll.saturating_add(n);
     }
 
+    /// 悬停在分隔条上的操作提示
+    pub fn hover_hint(&self) -> Option<&'static str> {
+        match self.hover_divider {
+            Some(Drag::Sidebar) => Some("⇔ 按住拖动调整左栏宽度（拖到最左收起）"),
+            Some(Drag::Input) => Some("⇕ 按住拖动调整输入框高度"),
+            None => None,
+        }
+    }
+
     pub fn toast_ok(&mut self, text: impl Into<String>) {
         self.toast = Some(Toast { text: text.into(), at: Instant::now(), error: false });
     }
@@ -833,6 +1288,40 @@ impl App {
             .as_ref()
             .filter(|t| t.at.elapsed() < Duration::from_secs(4))
     }
+}
+
+/// 通过 OSC 52 把文本写入系统剪贴板（终端支持时生效）
+fn osc52_copy(text: &str) {
+    use std::io::Write;
+    let payload = base64_encode(text.as_bytes());
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\x1b]52;c;{payload}\x07");
+    let _ = out.flush();
+}
+
+/// 极简 base64 编码（避免额外依赖）
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 /// 把数据库里的历史消息还原成聊天界面条目（重启后可继续看历史）
@@ -886,83 +1375,294 @@ pub fn display_from_stored(stored: &[StoredMessage]) -> Vec<Display> {
 mod tests {
     use super::*;
 
-    fn runtime() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_multi_thread()
+    pub(super) fn app() -> App {
+        let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
-            .unwrap()
-    }
-
-    fn app_with_db(rt: &tokio::runtime::Runtime) -> (App, Db) {
+            .unwrap();
         let db = rt.block_on(Db::open_memory()).unwrap();
-        let cfg = Config::default();
-        let agent = AgentHandle::spawn(rt, cfg.clone(), db.clone(), 1, Vec::new());
-        (App::new(cfg, agent, db.clone(), rt.handle().clone(), 1, Vec::new()), db)
+        let mut cfg = Config::default();
+        cfg.api_key = "sk-test-0000".into();
+        let agent = AgentHandle::spawn(&rt, cfg.clone(), db.clone(), 1, Vec::new());
+        let handle = rt.handle().clone();
+        std::mem::forget(rt);
+        App::new(cfg, agent, db, handle, 1, Vec::new())
     }
 
-    /// 回归测试：在配置页填完 Token 回车后，必须立刻写入数据库并生效
+    /// 在设置里输入 Token 并回车，必须立刻落到 SQLite 的 settings 表
     #[test]
     fn editing_token_saves_immediately() {
-        let rt = runtime();
-        let (mut app, db) = app_with_db(&rt);
+        let mut a = app();
+        a.open_settings();
+        assert_eq!(a.overlay, Overlay::Settings);
 
-        app.form.idx = F_API_KEY;
-        app.form.begin_edit();
-        app.form.buffer = "sk-regression-123456".to_string();
-        app.form.commit().unwrap();
-        app.form_dirty = true;
-        app.save_config();
+        a.form.idx = F_API_KEY;
+        a.form.begin_edit();
+        a.form.buffer = "sk-live-1234".into();
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
 
-        assert!(app.cfg.has_key(), "内存中的配置应已更新");
-        let pairs = rt.block_on(db.load_settings()).unwrap();
-        let saved = pairs
-            .iter()
-            .find(|(k, _)| k == "api_key")
-            .map(|(_, v)| v.clone());
-        assert_eq!(saved.as_deref(), Some("sk-regression-123456"));
+        assert_eq!(a.cfg.api_key, "sk-live-1234");
+        assert!(!a.form_dirty);
+        let saved = a.rt.block_on(a.db.load_settings()).unwrap();
+        assert!(saved.iter().any(|(k, v)| k == "api_key" && v == "sk-live-1234"));
     }
 
-    /// 回归测试：打开配置页不能冲掉未保存的输入
+    /// 正在编辑的设置项不能被重新打开设置时冲掉
     #[test]
-    fn open_config_keeps_dirty_form() {
-        let rt = runtime();
-        let (mut app, _db) = app_with_db(&rt);
+    fn open_settings_keeps_dirty_form() {
+        let mut a = app();
+        a.open_settings();
+        a.form.idx = F_API_KEY;
+        a.form.begin_edit();
+        a.form.buffer = "sk-partial".into();
+        a.form.edited = true;
+        a.form_dirty = true;
 
-        app.form.idx = F_API_KEY;
-        app.form.fields[F_API_KEY].value = "sk-typed-but-not-saved".to_string();
-        app.form_dirty = true;
-        app.open_config();
+        a.overlay = Overlay::None;
+        a.open_settings();
 
-        assert_eq!(app.form.fields[F_API_KEY].value, "sk-typed-but-not-saved");
+        assert!(a.form.editing);
+        assert_eq!(a.form.buffer, "sk-partial");
     }
 
-    /// 会话内容应能写入并从数据库还原
+    /// 重启后数据库里的历史消息要能还原成聊天界面
     #[test]
     fn messages_are_restored_into_display() {
-        let rt = runtime();
-        let db = rt.block_on(Db::open_memory()).unwrap();
-        let id = rt.block_on(db.create_session("测试会话", "deepseek-chat")).unwrap();
-        rt.block_on(db.append_message(
-            id,
-            &StoredMessage {
+        let stored = vec![
+            StoredMessage {
                 role: "user".into(),
-                content: "磁盘满了".into(),
+                content: "根分区满了怎么办".into(),
+                reasoning: String::new(),
+                tool_calls: None,
+                tool_call_id: None,
+                tool_name: None,
                 ok: true,
-                ..Default::default()
             },
-        ))
-        .unwrap();
+            StoredMessage {
+                role: "assistant".into(),
+                content: "先看下占用".into(),
+                reasoning: "思考".into(),
+                tool_calls: None,
+                tool_call_id: None,
+                tool_name: None,
+                ok: true,
+            },
+            StoredMessage {
+                role: "tool".into(),
+                content: "status: ok\n/dev/sda1 100%".into(),
+                reasoning: String::new(),
+                tool_calls: None,
+                tool_call_id: Some("call_1".into()),
+                tool_name: Some("shell".into()),
+                ok: true,
+            },
+        ];
+        let shown = display_from_stored(&stored);
+        assert_eq!(shown.len(), 3);
+        assert!(matches!(&shown[0], Display::User(t) if t.contains("根分区")));
+        assert!(matches!(&shown[1], Display::Assistant { text, streaming, .. }
+            if text == "先看下占用" && !streaming));
+        assert!(matches!(&shown[2], Display::ToolResult { name, output, ok }
+            if name == "shell" && *ok && output.contains("/dev/sda1")));
+    }
+}
 
-        let stored = rt.block_on(db.load_messages(id)).unwrap();
-        let display = display_from_stored(&stored);
-        assert_eq!(display.len(), 1);
-        match &display[0] {
-            Display::User(t) => assert_eq!(t, "磁盘满了"),
-            _ => panic!("应还原为用户消息"),
-        }
-        let history = crate::agent::history_from_stored(&stored);
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].role, "user");
+#[cfg(test)]
+mod layout_tests {
+    use super::tests::app;
+    use super::*;
+
+    fn click(a: &mut App, x: u16, y: u16) {
+        a.size = (120, 40);
+        a.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::empty(),
+        });
+    }
+
+    /// 点菜单栏的「设置」「关于」应打开对应弹窗
+    #[test]
+    fn menu_clicks_open_overlays() {
+        let mut a = app();
+        a.size = (120, 40);
+        let lay = crate::ui::layout::compute(Rect::new(0, 0, 120, 40), &mut a);
+
+        click(&mut a, lay.settings.x, lay.settings.y);
+        assert_eq!(a.overlay, Overlay::Settings);
+
+        a.overlay = Overlay::None;
+        click(&mut a, lay.about.x, lay.about.y);
+        assert_eq!(a.overlay, Overlay::About);
+
+        a.overlay = Overlay::None;
+        click(&mut a, lay.toggle_sidebar.x, lay.toggle_sidebar.y);
+        assert!(!a.sidebar_open);
+    }
+
+    /// 点左侧会话条目应切换到那个会话
+    #[test]
+    fn sidebar_click_switches_session() {
+        let mut a = app();
+        a.rt.block_on(a.db.create_session("磁盘告警排查", "deepseek-chat")).unwrap();
+        let other = a.rt.block_on(a.db.create_session("nginx 502", "deepseek-chat")).unwrap();
+        a.refresh_sessions();
+        assert!(a.sessions.len() >= 2);
+
+        a.size = (120, 40);
+        let lay = crate::ui::layout::compute(Rect::new(0, 0, 120, 40), &mut a);
+        let (id, rect) = lay
+            .session_items
+            .iter()
+            .find(|(id, _)| *id == other)
+            .copied()
+            .expect("应能定位到会话条目");
+        click(&mut a, rect.x + 1, rect.y);
+        assert_eq!(a.session_id, id);
+    }
+}
+
+#[cfg(test)]
+mod resize_tests {
+    use super::tests::app;
+    use super::*;
+
+    fn ev(kind: MouseEventKind, x: u16, y: u16) -> MouseEvent {
+        MouseEvent { kind, column: x, row: y, modifiers: KeyModifiers::empty() }
+    }
+
+    /// 侧边栏宽度可拖动，拖到最左边收起，且宽度会被记住
+    #[test]
+    fn sidebar_can_be_collapsed_and_dragged() {
+        let mut a = app();
+        a.size = (120, 40);
+        let lay = crate::ui::layout::compute(Rect::new(0, 0, 120, 40), &mut a);
+        let d = lay.sidebar_divider;
+
+        a.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), d.x, d.y));
+        assert_eq!(a.drag, Some(Drag::Sidebar));
+        a.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 40, d.y));
+        assert_eq!(a.sidebar_width, 40);
+        a.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), 40, d.y));
+        assert!(a.drag.is_none());
+
+        // 拖到最左侧 → 收起
+        let lay = crate::ui::layout::compute(Rect::new(0, 0, 120, 40), &mut a);
+        let d = lay.sidebar_divider;
+        a.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), d.x, d.y));
+        a.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 2, d.y));
+        assert!(!a.sidebar_open);
+    }
+
+    /// 输入框高度可上下拖动，也能用 Alt+↑↓ 调整，并夹在允许范围内
+    #[test]
+    fn input_height_can_be_dragged_and_keyed() {
+        let mut a = app();
+        a.size = (120, 40);
+        let lay = crate::ui::layout::compute(Rect::new(0, 0, 120, 40), &mut a);
+        let d = lay.input_divider;
+        let bottom = lay.footer.y;
+
+        a.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), d.x + 2, d.y));
+        assert_eq!(a.drag, Some(Drag::Input));
+        a.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), d.x + 2, bottom - 8));
+        assert_eq!(a.input_height, 8);
+        a.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), d.x + 2, bottom - 8));
+
+        a.adjust_input_height(100);
+        assert_eq!(a.input_height, crate::ui::layout::INPUT_MAX);
+        a.adjust_input_height(-100);
+        assert_eq!(a.input_height, crate::ui::layout::INPUT_MIN);
+    }
+
+    /// 界面偏好在松手后应写入 settings 表
+    #[test]
+    fn layout_prefs_persist() {
+        let mut a = app();
+        a.sidebar_width = 33;
+        a.input_height = 7;
+        a.save_ui_prefs();
+
+        let saved = a.rt.block_on(a.db.load_settings()).unwrap();
+        let get = |key: &str| {
+            saved
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(get("ui_sidebar_width"), "33");
+        assert_eq!(get("ui_input_height"), "7");
+        assert_eq!(get("ui_sidebar_open"), "true");
+    }
+
+    /// 鼠标移到分隔条上要有悬停状态（用于换指针形状、显示提示）
+    #[test]
+    fn hovering_dividers_sets_resize_state() {
+        let mut a = app();
+        a.size = (120, 40);
+        let lay = crate::ui::layout::compute(Rect::new(0, 0, 120, 40), &mut a);
+
+        let d = lay.sidebar_divider;
+        a.on_mouse(ev(MouseEventKind::Moved, d.x, d.y));
+        assert_eq!(a.hover_divider, Some(Drag::Sidebar));
+        assert!(a.hover_hint().is_some());
+
+        let d = lay.input_divider;
+        a.on_mouse(ev(MouseEventKind::Moved, d.x + 2, d.y));
+        assert_eq!(a.hover_divider, Some(Drag::Input));
+
+        // 移到聊天区 → 取消悬停
+        a.on_mouse(ev(MouseEventKind::Moved, lay.chat.x + 2, lay.chat.y + 2));
+        assert_eq!(a.hover_divider, None);
+        assert!(a.hover_hint().is_none());
+    }
+
+    /// 粘贴多行文本到输入框：换行保留，不会被当成多次回车提交
+    #[test]
+    fn paste_inserts_into_chat_input() {
+        let mut a = app();
+        a.on_paste("kubectl get pods\r\nkubectl logs -f web\r\n".into());
+        assert_eq!(a.input.value.trim_end(), "kubectl get pods\nkubectl logs -f web");
+        assert!(
+            !a.messages.iter().any(|m| matches!(m, Display::User(_))),
+            "粘贴不应触发提交"
+        );
+    }
+
+    /// 设置里刚进入编辑就粘贴 → 整体替换原值
+    #[test]
+    fn paste_into_settings_field() {
+        let mut a = app();
+        a.open_settings();
+        a.form.idx = F_API_KEY;
+        a.form.begin_edit();
+        a.on_paste("sk-pasted-9999\n".into());
+        assert_eq!(a.form.buffer, "sk-pasted-9999");
+        assert!(a.form_dirty);
+    }
+
+    /// 关于弹窗打开时不应接收粘贴
+    #[test]
+    fn paste_ignored_when_about_open() {
+        let mut a = app();
+        a.open_about();
+        a.on_paste("rm -rf /".into());
+        assert!(a.input.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::*;
+
+    #[test]
+    fn base64_encoding() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"abc def"), "YWJjIGRlZg==");
+        assert_eq!(base64_encode("磁盘".as_bytes()), "56OB55uY");
     }
 }

@@ -65,7 +65,22 @@ fn main() -> Result<()> {
     let mut app = app::App::new(cfg, agent, db, runtime.handle().clone(), session_id, stored);
 
     let mut terminal = ratatui::init();
+    // 支持鼠标点击菜单/会话列表
+    use ratatui::crossterm::event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    };
+    use ratatui::crossterm::execute;
+    let _ = execute!(
+        std::io::stdout(),
+        EnableMouseCapture,
+        EnableBracketedPaste
+    );
     let result = app.run(&mut terminal);
+    let _ = execute!(
+        std::io::stdout(),
+        DisableBracketedPaste,
+        DisableMouseCapture
+    );
     ratatui::restore();
 
     drop(runtime);
