@@ -520,3 +520,26 @@ mod border_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod selection_tests {
+    use super::tests::{flat, render, test_app};
+
+    /// 中文（多字节）选区：渲染不能 panic，高亮也不能丢
+    #[test]
+    fn cjk_selection_renders_without_panic() {
+        let mut app = test_app();
+        app.size = (110, 32);
+        app.input.insert_str("磁盘占用过高，帮我定位大文件");
+        app.input.select_all();
+
+        let screen = render(&mut app, 110, 32, "cjk-select");
+        assert!(flat(&screen).contains("磁盘"), "选中的中文应正常渲染");
+
+        // 选区边界逐个移动，每一种偏移都不能 panic（切片必须落在字符边界上）
+        for _ in 0..20 {
+            app.input.left_extend();
+            let _ = render(&mut app, 110, 32, "cjk-select-move");
+        }
+    }
+}

@@ -7,6 +7,14 @@
 //! 首次启动会进入配置界面，填写 DeepSeek API Token 即可开始使用。
 //! 配置与会话存放在 SQLite（`~/.local/share/ops-agent/ops-agent.db`）。
 
+// 生产代码禁止 unwrap()/expect()/panic!：错误一律用 anyhow 向上传播。
+// 单元测试（cfg(test)）不受限制，测试里用 unwrap 是惯用写法。
+// 需要临时绕过时把 deny 改成 allow，但请先想清楚失败时会发生什么。
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
 mod agent;
 mod app;
 mod config;

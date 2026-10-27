@@ -100,10 +100,19 @@ pub fn clip(s: &str, max: usize) -> String {
     out
 }
 
+/// 把字节偏移夹到 `s` 的合法字符边界上（等价于未来稳定的 `str::floor_char_boundary`）。
+/// 用于给 `&s[a..b]` 这类切片做兜底：偏移落在多字节字符中间时不会 panic。
+pub fn floor_boundary(s: &str, i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    // 最多回退 3 个字节（UTF-8 最长 4 字节）
+    (0..=3).map(|back| i.saturating_sub(back)).find(|k| s.is_char_boundary(*k)).unwrap_or(0)
+}
+
 /// 宽度不可靠的字符（Emoji 变体选择符、常被渲染成 2 格的符号）会让整行右移，
 /// 从而把它旁边的边框格子顶掉。这里统一替换成固定宽度的安全字符。
-pub fn sanitize(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
+pub fn sanitize(text: &str) -> String {    let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         match c {
             // 变体选择符 / 零宽连接符 / 组合键帽
@@ -156,5 +165,26 @@ mod tests {
     fn keeps_normal_text_and_cjk() {
         assert_eq!(sanitize("df -h 磁盘"), "df -h 磁盘");
         assert_eq!(sanitize("◆ ● ▌ ⇔"), "◆ ● ▌ ⇔");
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::floor_boundary;
+
+    #[test]
+    fn floor_boundary_never_splits_a_char() {
+        let s = "磁a盘"; // 字符边界：0, 3, 4, 7
+        assert_eq!(floor_boundary(s, 0), 0);
+        assert_eq!(floor_boundary(s, 1), 0, "落在多字节字符中间应回退");
+        assert_eq!(floor_boundary(s, 2), 0);
+        assert_eq!(floor_boundary(s, 3), 3);
+        assert_eq!(floor_boundary(s, 4), 4);
+        assert_eq!(floor_boundary(s, 5), 4);
+        assert_eq!(floor_boundary(s, 7), 7);
+        assert_eq!(floor_boundary(s, 99), 7, "越界应夹到末尾");
+        for i in 0..=s.len() {
+            assert!(s.is_char_boundary(floor_boundary(s, i)));
+        }
     }
 }

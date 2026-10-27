@@ -202,11 +202,29 @@ Agent → UI 用 `AgentEvent` 通道（增量文本、工具调用、结果、�
 cargo test
 ```
 
-25 项：SSE tool_calls 增量解析、本地 HTTP 回环流式、消息序列化、高危命令拦截、
+50 项：SSE tool_calls 增量解析、本地 HTTP 回环流式、消息序列化、高危命令拦截、
 kubectl 只读与 namespace 判定、SQLite 读写往返、配置回车即时落库（回归）、
 配置表单不被覆盖（回归）、历史还原、菜单/侧边栏点击命中（回归）、点击会话切换并加载消息、
 侧边栏收起与拖动改宽、输入框拖动/快捷键改高、布局偏好持久化、
 八个界面的渲染快照（`TestBackend`，产物在 `/tmp/ops-agent-ui/`）。
+
+### 代码约定：生产代码不用 `unwrap()`
+
+`src/main.rs` 顶部开启了 `deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)`
+（仅在非测试构建生效），所以：
+
+- 生产代码里写 `unwrap()` / `expect()` / `panic!` 会**直接编译失败**，错误请用
+  `anyhow::Result` + `?` / `with_context()` 向上传播
+- 确实需要“这里不可能失败”的地方，用 `if let` / `unwrap_or` / `unwrap_or_else` /
+  `get()` 这类不 panic 的写法
+- 单元测试（`#[cfg(test)]`）不受限制，`unwrap()` 在测试里是惯用写法
+
+检查方式：
+
+```bash
+cargo clippy            # 生产代码，出现 unwrap 即报错
+cargo clippy --all-targets -- -W clippy::indexing_slicing   # 顺带看越界风险
+```
 
 ## 安全说明
 

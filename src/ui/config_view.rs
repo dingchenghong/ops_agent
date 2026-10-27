@@ -74,7 +74,7 @@ fn draw_fields(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut cursor: Option<(u16, u16)> = None;
 
     for i in offset..rows.min(offset + view_h) {
-        let field = &app.form.fields[i];
+        let field = app.form.at(i);
         let selected = i == app.form.idx;
         let editing = selected && app.form.editing;
 
@@ -161,7 +161,7 @@ fn draw_info(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         ("已就绪", Style::new().fg(OK))
     };
-    let auto = app.form.fields[F_AUTO_APPROVE].value.eq_ignore_ascii_case("true");
+    let auto = app.form.at(F_AUTO_APPROVE).value.eq_ignore_ascii_case("true");
 
     let text = vec![
         Line::from(vec![

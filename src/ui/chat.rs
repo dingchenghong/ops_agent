@@ -9,7 +9,9 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use super::theme::*;
-use super::util::{clip, cursor_in, display_width, sanitize, wrap_layout, wrap_plain};
+use super::util::{
+    clip, cursor_in, display_width, floor_boundary, sanitize, wrap_layout, wrap_plain,
+};
 use crate::app::{App, Display, Overlay, Status, ToolState};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -466,7 +468,10 @@ pub fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
                 .filter(|(a, b)| a < b);
             match hit {
                 Some((a, b)) => {
-                    let (ra, rb) = (a - l.start, b - l.start);
+                    // 用 floor_boundary 对齐到字符边界：
+                    // 即使外部传来的偏移漂移，也只会切到字符中间之前的边界，不会 panic
+                    let ra = floor_boundary(&l.text, a.saturating_sub(l.start));
+                    let rb = floor_boundary(&l.text, b.saturating_sub(l.start)).max(ra);
                     if ra > 0 {
                         spans.push(Span::styled(l.text[..ra].to_string(), base()));
                     }

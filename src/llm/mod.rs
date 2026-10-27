@@ -119,8 +119,11 @@ pub async fn stream_chat(
         "max_tokens": cfg.max_tokens,
     });
     if !tools.is_empty() {
-        body["tools"] = json!(tools);
-        body["tool_choice"] = json!("auto");
+        // 用 as_object_mut 而不是 body["tools"]：后者在 Value 非对象时会 panic
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("tools".to_string(), json!(tools));
+            obj.insert("tool_choice".to_string(), json!("auto"));
+        }
     }
 
     let resp = http

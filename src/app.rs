@@ -165,6 +165,14 @@ pub struct ConfigForm {
     pub sel_all: bool,
 }
 
+/// 索引兜底用的空字段（`at()` 越界时返回它，避免 panic）
+static EMPTY_FIELD: FormField = FormField {
+    label: "",
+    hint: "",
+    kind: FieldKind::Text,
+    value: String::new(),
+};
+
 impl ConfigForm {
     pub fn from(cfg: &Config) -> Self {
         Self {
@@ -238,15 +246,27 @@ impl ConfigForm {
         }
     }
 
+    /// 按索引取字段：越界时回退到一个空字段而不是 panic
+    /// （索引由 `F_*` 常量与取模维护，正常不会越界，这里只是兜底）
+    pub fn at(&self, i: usize) -> &FormField {
+        self.fields.get(i).unwrap_or(&EMPTY_FIELD)
+    }
+
     pub fn current(&self) -> &FormField {
-        &self.fields[self.idx]
+        self.at(self.idx)
     }
 
     pub fn next(&mut self) {
+        if self.fields.is_empty() {
+            return;
+        }
         self.idx = (self.idx + 1) % self.fields.len();
     }
 
     pub fn prev(&mut self) {
+        if self.fields.is_empty() {
+            return;
+        }
         self.idx = (self.idx + self.fields.len() - 1) % self.fields.len();
     }
 
@@ -262,14 +282,16 @@ impl ConfigForm {
     }
 
     pub fn toggle(&mut self) {
-        let v = self.fields[self.idx].value.eq_ignore_ascii_case("true");
-        self.fields[self.idx].value = (!v).to_string();
+        if let Some(f) = self.fields.get_mut(self.idx) {
+            let v = f.value.eq_ignore_ascii_case("true");
+            f.value = (!v).to_string();
+        }
     }
 
     pub fn commit(&mut self) -> Result<()> {
         let idx = self.idx;
         let raw = self.buffer.trim().to_string();
-        match self.fields[idx].kind {
+        match self.at(idx).kind {
             FieldKind::Float => {
                 let v: f64 = raw.parse().with_context(|| "请输入数字，例如 0.3")?;
                 if !(0.0..=2.0).contains(&v) {
@@ -293,7 +315,9 @@ impl ConfigForm {
             }
             _ => {}
         }
-        self.fields[idx].value = raw;
+        if let Some(f) = self.fields.get_mut(idx) {
+            f.value = raw;
+        }
         self.editing = false;
         self.buffer.clear();
         self.edited = false;
@@ -311,7 +335,7 @@ impl ConfigForm {
     }
 
     fn val(&self, i: usize) -> String {
-        self.fields[i].value.trim().to_string()
+        self.at(i).value.trim().to_string()
     }
 
     pub fn to_config(&self, base: &Config) -> Result<Config> {
@@ -340,7 +364,7 @@ impl ConfigForm {
         cfg.max_tokens = self.val(F_MAX_TOKENS).parse().context("max_tokens 非法")?;
         cfg.max_tool_rounds = self.val(F_ROUNDS).parse().context("max_tool_rounds 非法")?;
         cfg.shell_timeout_secs = self.val(F_TIMEOUT).parse().context("命令超时非法")?;
-        cfg.auto_approve_all = self.fields[F_AUTO_APPROVE].value.eq_ignore_ascii_case("true");
+        cfg.auto_approve_all = self.at(F_AUTO_APPROVE).value.eq_ignore_ascii_case("true");
         cfg.kubectl_context = self.val(F_CONTEXT);
         cfg.kubectl_namespace = self.val(F_NAMESPACE);
         Ok(cfg)
@@ -1250,8 +1274,8 @@ impl App {
     }
 
     fn test_connection(&mut self) {
-        let key = self.form.fields[F_API_KEY].value.trim().to_string();
-        let base = self.form.fields[F_BASE_URL].value.trim().to_string();
+        let key = self.form.at(F_API_KEY).value.trim().to_string();
+        let base = self.form.at(F_BASE_URL).value.trim().to_string();
         let key = if key.is_empty() { self.cfg.effective_key() } else { key };
         self.agent.test_connection(key, base);
         self.toast_ok("正在测试连接…");
