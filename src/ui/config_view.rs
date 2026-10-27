@@ -45,7 +45,7 @@ pub fn draw_modal(frame: &mut Frame, app: &mut App) {
         .border_style(Style::new().fg(ACCENT))
         .title(Line::from(vec![
             Span::styled(" 设置 ", strong(ACCENT)),
-            Span::styled(" 配置写入 SQLite 的 settings 表", dim()),
+            // Span::styled(" 配置写入 SQLite 的 settings 表", dim()),
         ]))
         .title_bottom(Line::from(Span::styled(" Enter 确认并保存 · Esc 关闭 ", dim())))
         .padding(Padding::new(1, 1, 0, 0));
